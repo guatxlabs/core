@@ -1556,8 +1556,11 @@
         // Un VRAI terme libre (aucun opérateur de comparaison) garde le chemin LIKE, inchangé.
         let a = to_sql("search failed password", 0, 0, &Schema::events()).unwrap();
         assert!(a.contains("message LIKE '%failed%'") && a.contains("message LIKE '%password%'"), "{a}");
-        // Une PHRASE quotée qui contient un `=` reste un terme libre (elle ne prétend pas nommer un
-        // champ : sa partie gauche n'a pas la forme d'un identifiant).
+        // Une PHRASE quotée qui contient un `=` reste un terme libre. ATTENTION à ne pas lire ce cas
+        // comme une preuve générale : `GET /x?a=1` est exempté DEUX FOIS (jeton quoté, ET partie gauche
+        // sans forme de nom de champ). La garantie « une phrase quotée n'est jamais lue comme un nom de
+        // champ » est prouvée par `s11_quoted_phrase_is_never_read_as_a_field_name`, dont les cas ont
+        // une partie gauche EN forme de nom de champ (`user-agent=…`) — les 6 régressions mesurées.
         let b = to_sql("search \"GET /x?a=1\"", 0, 0, &Schema::events()).unwrap();
         assert!(b.contains("LIKE '%GET /x?a=1%'"), "{b}");
         // Un horodatage (`:` = alias de `=`) n'est pas un nom de champ : reste un terme libre.
