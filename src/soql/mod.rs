@@ -622,6 +622,15 @@ fn metric_base(spec: &str, from: i64, to: i64, row_filter: Option<&RowFilter>, d
                 return Err(format!("metric : label invalide : {k}"));
             }
             conds.push(format!("{}='{}'", d.json_extract("labels", k), d.escape_literal(v)));
+        } else {
+            // S10 — FIN DE BOUCLE FAIL-CLOSED. Un jeton qui ne matche NI `by`, NI `value<op>N`, NI `k=v`
+            // tombait ici SANS `else` : le terme s'évaporait en silence et la requête renvoyait TOUTES les
+            // séries de la métrique (`metric node_load1 garbage`, `metric node_load1 job:api` — mesurés).
+            // C'est le MÊME mode d'échec que le filtre de label ci-dessus : on refuse de la même façon.
+            return Err(format!(
+                "metric : terme non supporté : {} (attendu `label=valeur`, `value<op>N`, ou `by label1,label2`)",
+                toks[i]
+            ));
         }
         i += 1;
     }
@@ -641,7 +650,12 @@ fn metric_base(spec: &str, from: i64, to: i64, row_filter: Option<&RowFilter>, d
         // S10 — FAIL-CLOSED (même défaut que le filtre de label ci-dessus) : un label de `by` non-identifiant
         // faisait disparaître le GROUPEMENT en silence -> séries agrégées ensemble au lieu d'être séparées.
         if !soql_ident_ok(l) {
-            return Err(format!("metric : label invalide dans `by` : {l}"));
+            // Le libellé nomme ce que l'UTILISATEUR a écrit, pas un « label » qu'il n'a jamais écrit :
+            // `by` JOINT ses jetons avec un espace avant de couper sur les virgules, donc `by code extra`
+            // produisait le pseudo-label « code extra ». On rappelle le séparateur attendu.
+            return Err(format!(
+                "metric : label invalide dans `by` : « {l} » (les labels de `by` se séparent par des virgules : `by code,job`)"
+            ));
         }
         sel.push_str(&format!(",{} AS {}", d.json_extract("labels", l), soql_qid(l)));
         selr.push_str(&format!(",{} AS {}", d.json_extract("labels", l), soql_qid(l)));

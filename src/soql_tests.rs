@@ -1744,3 +1744,58 @@
         assert!(big.len() > 20_000, "la liste doit être volumineuse : {} octets", big.len());
         to_sql(&big, 0, 0, &ev).unwrap_or_else(|e| panic!("une liste `in` de 2000 IP doit compiler : {e}"));
     }
+
+    // --- S10 (suite) : un jeton `metric` non reconnu ne s'évapore plus en fin de boucle ---------
+    #[test]
+    fn s10_metric_unrecognised_token_is_error() {
+        // MESURÉ sur 4b16822 : seule la branche `split_once('=')` avait été passée en fail-closed. Un
+        // jeton qui ne matche NI `by`, NI `value<op>N`, NI `k=v` tombait en fin de boucle sans `else` :
+        //   metric node_load1 garbage  -> SELECT ts,host,value FROM metric WHERE name='node_load1' …
+        //   metric node_load1 job:api  -> idem
+        // soit TOUTES les séries de la métrique au lieu du sous-ensemble demandé — mot pour mot le mode
+        // d'échec que S10 déclarait fermé.
+        for (q, tok) in [
+            ("metric node_load1 garbage", "garbage"),
+            ("metric node_load1 job:api", "job:api"),
+            ("metric node_load1 value~3", "value~3"),
+        ] {
+            match to_sql(q, 0, 0, &Schema::events()) {
+                Ok(sql) => panic!("attendu une erreur pour « {q} », obtenu du SQL : {sql}"),
+                Err(e) => assert!(e.contains(tok), "l'erreur doit nommer le jeton {tok} : {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn s10_metric_by_error_explains_the_comma_separator() {
+        // Le message « label invalide dans `by` : code extra » était bancal : `by` JOINT ses jetons avec
+        // un espace, donc l'utilisateur qui écrit `by code extra` lit un « label » qu'il n'a pas écrit.
+        // L'erreur doit dire ce qui est attendu (séparateur virgule).
+        let e = to_sql("metric node_load1 by code extra", 0, 0, &Schema::events())
+            .expect_err("un `by` mal séparé doit être refusé");
+        assert!(e.contains("virgule"), "l'erreur doit expliquer le séparateur : {e}");
+    }
+
+    #[test]
+    fn s10_metric_legitimate_specs_are_unchanged() {
+        // ANTI-RÉGRESSION : les 5 formes `metric` légitimes (corpus + seeds) rendent le MÊME SQL.
+        let ev = Schema::events();
+        let m = "SELECT ts,host,value FROM metric WHERE name='node_load1'";
+        let r = "SELECT ts,host,avg AS value FROM metric_rollup WHERE name='node_load1'";
+        assert_eq!(to_sql("metric node_load1", 0, 0, &ev).unwrap(), format!("{m} UNION ALL {r} ORDER BY ts"));
+        assert_eq!(
+            to_sql("metric node_load1 value>3", 0, 0, &ev).unwrap(),
+            format!("{m} AND value > 3 UNION ALL {r} AND avg > 3 ORDER BY ts")
+        );
+        let h = "SELECT ts,host,value FROM metric WHERE name='http_requests_total'";
+        let hr = "SELECT ts,host,avg AS value FROM metric_rollup WHERE name='http_requests_total'";
+        assert_eq!(
+            to_sql("metric http_requests_total job=api", 0, 0, &ev).unwrap(),
+            format!("{h} AND json_extract(labels,'$.job')='api' UNION ALL {hr} AND json_extract(labels,'$.job')='api' ORDER BY ts")
+        );
+        let byc = "SELECT ts,host,value,json_extract(labels,'$.code') AS \"code\" FROM metric WHERE name='http_requests_total'";
+        let byr = "SELECT ts,host,avg AS value,json_extract(labels,'$.code') AS \"code\" FROM metric_rollup WHERE name='http_requests_total'";
+        assert_eq!(to_sql("metric http_requests_total by code", 0, 0, &ev).unwrap(), format!("{byc} UNION ALL {byr} ORDER BY ts"));
+        // Séparation par virgule (avec ou sans espace) : toujours acceptée.
+        assert!(to_sql("metric http_requests_total by code, job", 0, 0, &ev).is_ok());
+    }
