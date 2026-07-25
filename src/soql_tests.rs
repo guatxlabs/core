@@ -1703,3 +1703,44 @@
             format!("{b} WHERE message LIKE '%rate-limit%' AND message LIKE '%exceeded%'")
         );
     }
+
+    // --- S2 (suite) : le contrôle de taille couvre AUSSI une requête à une seule étape ----------
+    #[test]
+    fn s2_single_stage_query_is_bounded_too() {
+        // MESURÉ sur 4b16822 : `if sql.len() > max_sql` vivait DANS `for stage in &stages[1..]`, donc
+        // une requête à UNE SEULE étape — la forme la plus courante — n'était JAMAIS vérifiée :
+        //   `search a a a …` x 200 000 = 400 006 octets de texte -> 4 600 089 octets de SQL, 0 erreur.
+        let q = format!("search{}", " a".repeat(200_000));
+        let e = to_sql(&q, 0, 0, &Schema::events())
+            .expect_err("une requête à UNE étape doit être bornée elle aussi");
+        assert!(e.contains("trop complexe"), "erreur de taille attendue : {e}");
+    }
+
+    #[test]
+    fn s2_query_text_is_bounded() {
+        // MESURÉ sur 4b16822 : rien ne bornait la LONGUEUR DU TEXTE d'entrée. Le SQL émis est vérifié
+        // APRÈS chaque étape, donc le pic transitoire d'UNE étape n'est borné que par le texte.
+        let q = format!("search {}", "a".repeat(1_100_000));
+        let e = to_sql(&q, 0, 0, &Schema::events()).expect_err("le texte de requête doit être borné");
+        assert!(e.contains("trop long"), "erreur de longueur de texte attendue : {e}");
+    }
+
+    #[test]
+    fn s2_bounds_leave_realistic_queries_alone() {
+        // ANTI-RÉGRESSION : 5 requêtes d'analyste réalistes (corpus livré) rendent le SQL ATTENDU, et
+        // une requête volumineuse mais PLAUSIBLE (liste `in` de 2 000 valeurs, ~24 Ko de texte) compile.
+        let ev = Schema::events();
+        for q in [
+            "search source=web scope=external | stats count by src_ip | sort -count | head 20",
+            "search source=cloudflare | stats values(user) by src_ip",
+            "search source=web | eventstats count by src_ip | where count > 10 | stats count",
+            "search source=conntrack dir=outbound scope=external | sort -ts | table dst_host,dst_ip,proc,dport",
+            "search | timechart span=1h count",
+        ] {
+            to_sql(q, 0, 0, &ev).unwrap_or_else(|e| panic!("doit compiler ({q}) : {e}"));
+        }
+        let vals: Vec<String> = (0..2000).map(|i| format!("10.0.{}.{}", i / 256, i % 256)).collect();
+        let big = format!("search src_ip in ({})", vals.join(","));
+        assert!(big.len() > 20_000, "la liste doit être volumineuse : {} octets", big.len());
+        to_sql(&big, 0, 0, &ev).unwrap_or_else(|e| panic!("une liste `in` de 2000 IP doit compiler : {e}"));
+    }
