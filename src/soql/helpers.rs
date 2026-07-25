@@ -35,6 +35,17 @@ pub(crate) fn soql_ident_ok(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// TRUE si `s` a la FORME d'un nom de champ, c'est-à-dire si un jeton `s<op>valeur` PRÉTEND filtrer un
+/// champ : commence par une lettre ASCII ou `_`, et ne contient que `[A-Za-z0-9_.-]`. Sert UNIQUEMENT à
+/// distinguer un nom de champ MAL ÉCRIT (`x-forwarded-for`, `http.status` -> erreur explicite, cf.
+/// `table_conds`) d'un VRAI terme libre (phrase quotée, horodatage `10:00:00`, chemin/URL) qui garde le
+/// scan plein-texte. Un identifiant VALIDE (`soql_ident_ok`) est un sous-ensemble de cette forme.
+pub(crate) fn soql_fieldish(s: &str) -> bool {
+    let mut cs = s.chars();
+    matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
 /// Échappe une valeur pour un littéral chaîne SQL (doublage des `'`). PUBLIC (cf. `soql_tokenize`).
 pub fn soql_esc(s: &str) -> String {
     s.replace('\'', "''")
