@@ -1601,7 +1601,7 @@
     #[test]
     fn in_prepass_never_filters_a_field_the_user_did_not_name() {
         // DÉFAUT PRÉ-EXISTANT (mesuré sur 4b16822, AVANT ce correctif) : la classe `[A-Za-z0-9_]*` de
-        // `soql_in_re` n'accrochait que le DERNIER segment après le tiret/point.
+        // la classe de `in_clause_re` n'accrochait que le DERNIER segment après le tiret/point.
         //   search x-forwarded-for in (1,2) -> CAST(json_extract(fields,'$.for') AS REAL) IN (1,2)
         //   search src-ip in (10,11)        -> ... '$.ip'  ... IN (10,11)
         //   search http.status in (500,502) -> ... '$.status' ... IN (500,502)
@@ -1621,7 +1621,7 @@
                 }
             }
         }
-        // Même défaut sur l'étape `where` (le pré-pass y passe par `soql_parse_in`).
+        // Même défaut sur l'étape `where` (le pré-pass y passe par `in_clause_whole`).
         let e = to_sql("search | where x-forwarded-for in (1,2)", 0, 0, &Schema::events())
             .expect_err("`where` doit refuser, pas filtrer un autre champ");
         assert!(e.contains("x-forwarded-for"), "l'erreur doit nommer le champ complet : {e}");
@@ -1630,8 +1630,9 @@
     // Le nom d'une clause `in (...)` n'est plus défini par une CLASSE DE CARACTÈRES mais par la
     // FRONTIÈRE de jeton : aucun séparateur, présent ou futur, ne peut donc rouvrir la troncature.
     // CE TEST EST ÉCRIT CONTRE LA CLASSE, PAS CONTRE LES CAS TRAITÉS : la liste ci-dessous contient
-    // des séparateurs que le code ne nomme NULLE PART (le code ne nomme que l'espace et `(`), y compris
-    // non-ASCII, ainsi que des écritures multi-lignes et des casses mélangées.
+    // des séparateurs que le code ne nomme NULLE PART — le seul caractère qu'il lit encore est le
+    // délimiteur OUVRANT de la liste de la clause elle-même, retiré en TÊTE du jeton (groupement) et
+    // LU dans le match, pas écrit. Y compris non-ASCII, écritures multi-lignes et casses mélangées.
     #[test]
     fn in_prepass_field_name_is_bounded_by_the_token_not_by_a_character_class() {
         // MESURÉ sur 742efe7 : la classe `[A-Za-z0-9_.-]` ne retenait que le DERNIER segment ->
@@ -1721,6 +1722,109 @@
         assert_eq!(
             to_sql("search message=\"user in (a,b)\"", 0, 0, &ev).unwrap(),
             format!("{base} WHERE \"message\" = 'user in (a,b)'")
+        );
+    }
+
+    // --- PRÉ-PASS `in (...)` : PLUS AUCUNE EXCEPTION DE CARACTÈRE, PAS MÊME `(` -----------------
+    #[test]
+    fn in_prepass_has_no_separator_exception_not_even_the_grouping_one() {
+        // DÉFAUT MESURÉ sur 6fff644 (sonde hors dépôt, export `git archive HEAD`) : la classe
+        // `[^\s(]+` EXCLUAIT la parenthèse ouvrante, donc le jeton restait coupé DESSUS et le filtre
+        // repartait sur le suffixe — un champ que l'utilisateur n'a jamais nommé :
+        //   search foo(host in (1,2)        -> "host" IN (1,2) AND message LIKE '%foo(%'
+        //   search count(src_ip in (10,11)) -> "src_ip" IN (10,11) AND …
+        //   search a(b(host in (1,2)        -> "host" IN (1,2) AND …
+        //   search lower(host in (a,b))     -> "host" COLLATE NOCASE IN ('a','b') AND …
+        // `"host"` et `"src_ip"` sont les VRAIES colonnes indexées : filtre MUET, faux négatif dans une
+        // règle. ATTENDU : refus nommant le jeton ENTIER, et jamais le champ fantôme.
+        //
+        // CE TEST EST ÉCRIT CONTRE LA CLASSE, PAS CONTRE LES CAS TRAITÉS. La liste ci-dessous mélange
+        // volontairement des caractères que le code ne nomme NULLE PART (le seul caractère qu'il lit est
+        // le délimiteur ouvrant de la liste de la clause elle-même, LU dans le match) : ZWSP, SHY, hors
+        // BMP, ponctuation, guillemet simple, et la parenthèse en position MÉDIANE.
+        for (q, field, ghost) in [
+            ("search foo(host in (1,2)", "foo(host", "\"host\""),
+            ("search count(src_ip in (10,11))", "count(src_ip", "\"src_ip\""),
+            ("search a(b(host in (1,2)", "a(b(host", "\"host\""),
+            ("search lower(host in (a,b))", "lower(host", "\"host\""),
+            ("search x=(y in (1,2))", "x=(y", "$.y"),
+            ("search foo(bar)baz in (1,2)", "foo(bar)baz", "$.baz"),
+            // Caractères jamais nommés par le correctif :
+            ("search foo\u{200b}host in (1,2)", "foo\u{200b}host", "\"host\""),
+            ("search foo\u{00ad}host in (1,2)", "foo\u{00ad}host", "\"host\""),
+            ("search foo\u{1d53d}host in (1,2)", "foo\u{1d53d}host", "\"host\""),
+            ("search foo\u{00b7}host in (1,2)", "foo\u{00b7}host", "\"host\""),
+            ("search foo\u{00a4}host in (1,2)", "foo\u{00a4}host", "\"host\""),
+            ("search foo\u{00ac}host in (1,2)", "foo\u{00ac}host", "\"host\""),
+            ("search foo\u{00b6}host in (1,2)", "foo\u{00b6}host", "\"host\""),
+            ("search foo\\host in (1,2)", "foo\\host", "\"host\""),
+        ] {
+            match to_sql(q, 0, 0, &Schema::events()) {
+                Ok(sql) => panic!("attendu une erreur pour « {q} », obtenu un filtre : {sql}"),
+                Err(e) => {
+                    assert!(e.contains(field), "l'erreur doit nommer le jeton ENTIER {field} : {e}");
+                    assert!(!e.contains(ghost), "l'erreur ne doit pas parler du champ fantôme {ghost} : {e}");
+                }
+            }
+        }
+        // Le backtick est intercepté PLUS TÔT (couche macro) et n'atteint pas le pré-pass : il est
+        // refusé, mais avec le message de cette couche-là. On ne réclame donc que le refus.
+        to_sql("search foo`host in (1,2)", 0, 0, &Schema::events()).expect_err("backtick refusé en amont");
+        // CAS NON TRAITÉ EXPLICITEMENT, VÉRIFIÉ QUAND MÊME : sans blanc avant `in` (`host(in (1,2)`)
+        // il n'y a pas de clause du tout — la sortie est un scan plein-texte, et surtout AUCUN filtre
+        // sur `host` n'est émis. C'est l'autre face de la garde : ne pas fabriquer de filtre fantôme.
+        let s = to_sql("search host(in (1,2)", 0, 0, &Schema::events()).unwrap();
+        assert!(!s.contains(" IN ("), "aucun filtre `IN` ne doit être fabriqué ici : {s}");
+        assert!(s.contains("LIKE '%host(in%'"), "{s}");
+        // ATTEIGNABLE EN SOUS-RECHERCHE : la garde vaut à la profondeur maximale (3), comme au depth 0.
+        let e = to_sql(
+            "search source=a | append [search source=b | append [search source=c | append [search foo(host in (1,2) | stats count]]]",
+            0, 0, &Schema::events(),
+        ).expect_err("la garde doit valoir à la profondeur 3");
+        assert!(e.contains("foo(host"), "{e}");
+        assert!(!e.contains("\"host\" IN"), "{e}");
+    }
+
+    #[test]
+    fn in_prepass_leading_parens_are_grouping_and_stay_legitimate() {
+        // CONTRE-PREUVE, ET C'EST ELLE QUI INTERDIT DE RETIRER L'EXCEPTION BÊTEMENT : une parenthèse
+        // OUVRANTE DE TÊTE est du GROUPEMENT, pas une partie du nom. Elle est retirée de la tête du
+        // jeton (le reste doit être un identifiant entier) puis RÉÉMISE dans le texte résiduel, où elle
+        // repart en terme libre. Goldens LITTÉRAUX relevés par sonde sur le TAG PUBLIC v0.2.0 (48035b9)
+        // ET sur 6fff644 : ces cinq formes rendent le MÊME SQL à l'octet près.
+        let ev = Schema::events();
+        let b = "SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event";
+        for (q, want) in [
+            ("search (foo in (1,2)", format!("{b} WHERE CAST(json_extract(fields,'$.foo') AS REAL) IN (1,2) AND message LIKE '%(%'")),
+            ("search (foo in (1,2))", format!("{b} WHERE CAST(json_extract(fields,'$.foo') AS REAL) IN (1,2) AND message LIKE '%(%' AND message LIKE '%)%'")),
+            ("search ((foo in (1,2)))", format!("{b} WHERE CAST(json_extract(fields,'$.foo') AS REAL) IN (1,2) AND message LIKE '%((%' AND message LIKE '%))%'")),
+            ("search (dport in (80,443))", format!("{b} WHERE CAST(json_extract(fields,'$.dport') AS REAL) IN (80,443) AND message LIKE '%(%' AND message LIKE '%)%'")),
+            ("search a=1 (b in (1,2))", format!("{b} WHERE CAST(json_extract(fields,'$.b') AS REAL) IN (1,2) AND CAST(json_extract(fields,'$.a') AS REAL) = 1 AND message LIKE '%(%' AND message LIKE '%)%'")),
+        ] {
+            assert_eq!(to_sql(q, 0, 0, &ev).unwrap(), want, "groupement légitime réécrit : {q}");
+        }
+        // Une parenthèse FERMANTE de tête, elle, n'est pas du groupement d'ouverture : le nom réclamé
+        // reste `)a` et la clause est refusée. Cas jamais traité explicitement, il tombe du bon côté.
+        let e = to_sql("search )a in (1,2)", 0, 0, &ev).expect_err("`)a` n'est pas un nom");
+        assert!(e.contains(")a"), "{e}");
+        // `search (a) in (1,2)` : le groupement de TÊTE part, `a)` reste -> refusé en nommant `a)`.
+        let e = to_sql("search (a) in (1,2)", 0, 0, &ev).expect_err("`a)` n'est pas un nom");
+        assert!(e.contains("a)"), "{e}");
+        // ÉTAPE `where` : elle n'a AUCUNE grammaire de groupement (mesuré sur 48035b9 comme sur
+        // 6fff644 : `where (count > 5)` est refusé). Un préfixe de groupement y signifie donc de la
+        // structure que `where` ne sait pas lire -> ce n'est pas une clause pure, et le refus est
+        // INCHANGÉ. Ces trois formes ne doivent pas devenir compilables au prétexte du peeling.
+        for q in [
+            "search | where (dport in (80,443))",
+            "search | where ((a in (1)) or (b in (2)))",
+            "search | where (dport in (80,443)",
+        ] {
+            to_sql(q, 0, 0, &ev).expect_err(&format!("`where` n'a pas de groupement : {q}"));
+        }
+        // ... et la clause `where` NUE reste intacte.
+        assert_eq!(
+            to_sql("search | where dport in (80,443)", 0, 0, &ev).unwrap(),
+            format!("SELECT * FROM ({b}) WHERE CAST(json_extract(fields,'$.dport') AS REAL) IN (80,443)")
         );
     }
 
@@ -1868,20 +1972,43 @@
                 "l'échappatoire suggérée doit compiler en plein-texte sur le texte suggéré"
             );
         }
+        // PORTÉE EXACTE DE CETTE PROMESSE — elle n'est PAS universelle, et ce test le pinne plutôt que
+        // de laisser la docstring l'affirmer plus large qu'elle n'est. Sur 400 suggestions tirées d'un
+        // corpus adverse, 389 rendent bien un plein-texte ; les 11 autres rendent une ÉGALITÉ, parce
+        // que le texte suggéré COMMENCE lui-même par un identifiant valide suivi d'un opérateur. Mesuré
+        // identique sur le tag public v0.2.0 (48035b9) : limite PRÉ-EXISTANTE du chemin quoté, pas une
+        // conséquence de la garde — et le SQL rendu est celui de v0.2.0 à l'octet près.
+        assert_eq!(
+            to_sql("search \"b: not in ()\"", 0, 0, &ev).unwrap(),
+            format!("{b} WHERE json_extract(fields,'$.b') = ' not in ()'")
+        );
+        assert_eq!(
+            to_sql("search \"source=web  In ()\"", 0, 0, &ev).unwrap(),
+            format!("{b} WHERE \"source\" = 'web  In ()'")
+        );
     }
 
     // --- LIMITE DOCUMENTÉE : `eval` n'a pas (et ne peut pas avoir) la garde de nom de champ ------
     #[test]
     fn eval_is_the_documented_blind_spot_of_the_field_name_guard() {
         let ev = Schema::events();
-        // MESURÉ : `eval x = foo-bar` compile, et rend EXACTEMENT le SQL de la soustraction explicite
-        // `foo - bar`. Ce test PINGLE la limite au lieu de la laisser se découvrir en revue : tant que
-        // les deux écritures rendent le même SQL, aucune garde ne peut les distinguer, et un nom mal
+        // CORRECTION D'UNE AFFIRMATION FAUSSE (commit 9fcabd6, « byte for byte ») : les deux SQL ne
+        // sont PAS identiques à l'octet, et ce test le MESURE au lieu de normaliser avant de comparer.
+        // Ce qui est vrai et suffisant : ils ne diffèrent QUE par des blancs — `-` est l'opérateur de
+        // soustraction dans une expression, et SQLite compile les deux en le même programme (mesuré
+        // hors test : `EXPLAIN SELECT (foo-bar) FROM t` == `EXPLAIN SELECT (foo - bar) FROM t`,
+        // bytecode identique, sqlite 3.53.3). Aucune garde ne peut donc les distinguer, et un nom mal
         // écrit échoue à l'EXÉCUTION (colonnes inexistantes), pas à la compilation.
         let a = to_sql("search | eval x = foo-bar", 0, 0, &ev).unwrap();
         let b = to_sql("search | eval x = foo - bar", 0, 0, &ev).unwrap();
         assert!(a.contains("(foo-bar) AS \"x\""), "{a}");
-        assert_eq!(a.replace("foo-bar", "foo - bar"), b, "les deux écritures rendent le même SQL");
+        assert!(b.contains("(foo - bar) AS \"x\""), "{b}");
+        assert_ne!(a, b, "les deux SQL diffèrent bien (l'affirmation « byte for byte » était fausse)");
+        assert_eq!(
+            a.replace(' ', ""),
+            b.replace(' ', ""),
+            "et ils ne diffèrent QUE par des blancs — c'est CE point qui rend les deux lectures indiscernables"
+        );
         // ET LA CONTREPARTIE : la limite est bien CIRCONSCRITE à `eval`. Les autres étapes qui prennent
         // un nom de champ le valident, elles.
         for q in [
@@ -2020,6 +2147,65 @@
                 Ok(sql) => panic!("attendu une erreur pour « {q} », obtenu du SQL : {sql}"),
                 Err(e) => assert!(e.contains(tok), "l'erreur doit nommer le jeton {tok} : {e}"),
             }
+        }
+    }
+
+    // --- S10 (suite) : UNE SEULE PORTE DÉCIDE D'UNE LISTE `by`, POUR LES QUATRE ÉTAPES ----------
+    #[test]
+    fn a_by_list_is_decided_in_one_place_for_all_four_stages() {
+        // DÉFAUT MESURÉ sur 6fff644 ET sur le tag public 48035b9 (donc pré-existant) : le
+        // `.filter(|s| !s.is_empty())` avait été retiré de `metric_base` seulement. Les TROIS autres
+        // étapes à `by` passent par `by_fields`, qui le portait encore ligne pour ligne :
+        //   search | stats count by        -> SELECT ,COUNT(*) … GROUP BY        (SQL INVALIDE émis)
+        //   search | stats count by ,      -> idem
+        //   search | timechart span=1h count by ,  -> le `by` demandé S'ÉVAPORE, sans un mot
+        //   search | stats count by ,src_ip        -> label vide jeté en silence
+        //   search | eventstats count by ,src_ip   -> idem
+        // Les quatre étapes passent maintenant par `ByLabels::parse`, et c'est LUI qui décide.
+        // Les échecs sont ACCUMULÉS, pas levés au premier : une mutation de la porte doit se voir
+        // NOMMER LES QUATRE ÉTAPES dans la sortie d'échec, pas seulement la première rencontrée.
+        let ev = Schema::events();
+        let mut leaks: Vec<String> = Vec::new();
+        for (stage, tpl, label, want_msg) in [
+            ("stats", "search | stats count {}", "src_ip", "champ invalide"),
+            ("timechart", "search | timechart span=1h count {}", "src_ip", "champ invalide"),
+            ("eventstats", "search | eventstats count {}", "src_ip", "champ invalide"),
+            ("eventstats(values)", "search | eventstats values(user) {}", "src_ip", "champ invalide"),
+            ("metric", "metric node_load1 {}", "code", "label invalide dans `by`"),
+        ] {
+            for shape in ["by", "by ,", "by ,,", "by ,{L}", "by {L},", "by {L},,host"] {
+                let q = tpl.replace("{}", &shape.replace("{L}", label));
+                match to_sql(&q, 0, 0, &ev) {
+                    Ok(sql) => leaks.push(format!("[{stage}] « {q} » a compilé au lieu d'être refusé : {sql}")),
+                    Err(e) => {
+                        if !e.contains(want_msg) {
+                            leaks.push(format!("[{stage}] « {q} » : message inattendu : {e}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(leaks.is_empty(), "un `by` demandé s'est évaporé :\n{}", leaks.join("\n"));
+        // CONTRE-PREUVE — les `by` LÉGITIMES des quatre étapes rendent le SQL du tag public v0.2.0,
+        // goldens littéraux (relevés par sonde sur 48035b9 et sur 6fff644 : identiques).
+        let b = "SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event";
+        for (q, want) in [
+            ("search | stats count by src_ip", format!("SELECT \"src_ip\" AS \"src_ip\",COUNT(*) AS \"count\" FROM ({b}) GROUP BY \"src_ip\"")),
+            ("search | stats count by src_ip,host", format!("SELECT \"src_ip\" AS \"src_ip\",\"host\" AS \"host\",COUNT(*) AS \"count\" FROM ({b}) GROUP BY \"src_ip\",\"host\"")),
+            ("search | timechart span=1h count by source", format!("SELECT (ts/3600)*3600 AS bucket,\"source\" AS \"source\",COUNT(*) AS \"count\" FROM ({b}) GROUP BY bucket,\"source\" ORDER BY bucket")),
+            ("search | eventstats count by host", format!("SELECT *, COUNT(*) OVER (PARTITION BY \"host\") AS \"count\" FROM ({b})")),
+            ("metric node_load1 by code", "SELECT ts,host,value,json_extract(labels,'$.code') AS \"code\" FROM metric WHERE name='node_load1' UNION ALL SELECT ts,host,avg AS value,json_extract(labels,'$.code') AS \"code\" FROM metric_rollup WHERE name='node_load1' ORDER BY ts".to_string()),
+        ] {
+            assert_eq!(to_sql(q, 0, 0, &ev).unwrap(), want, "`by` légitime réécrit : {q}");
+        }
+        // Un `by` sans virgule mais mal séparé reste refusé par la MÊME porte, sur les quatre étapes.
+        for q in [
+            "search | stats count by src_ip host",
+            "search | timechart span=1h count by src_ip host",
+            "search | eventstats count by src_ip host",
+            "metric node_load1 by code job",
+        ] {
+            to_sql(q, 0, 0, &ev).expect_err(&format!("« {q} » : `by` se sépare par des virgules"));
         }
     }
 

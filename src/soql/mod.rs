@@ -607,14 +607,18 @@ fn metric_base(spec: &str, from: i64, to: i64, row_filter: Option<&RowFilter>, d
     let mut i = 2;
     while i < toks.len() {
         if toks[i] == "by" {
-            // S10 — AUCUN LABEL N'EST JETÉ ICI. Le `.filter(|s| !s.is_empty())` qui vivait là faisait
-            // DISPARAÎTRE en silence tout label vide, donc `by` NU (`metric node_load1 by`), `by ,`,
-            // `by ,code`, `by code,,job` — mesurés : le regroupement s'évaporait sans un mot, exactement
-            // le mode d'échec S10. La liste est rendue TELLE QUELLE et c'est la validation `soql_ident_ok`
-            // ci-dessous — le SEUL endroit où un label est accepté ou refusé — qui tranche. `by` nu donne
-            // `"".split(',')` = UN label vide -> refusé lui aussi, pas de cas particulier à écrire.
+            // S10 — LA MÊME PORTE QUE LES TROIS AUTRES ÉTAPES À `by` (`stats`, `timechart`,
+            // `eventstats` via `by_fields`) : `ByLabels::parse` décide, ici comme là-bas. Aucun label
+            // n'est jeté ; `by` NU donne `"".split(',')` = UN label vide, refusé comme les autres.
+            // Le libellé nomme ce que l'UTILISATEUR a écrit, pas un « label » qu'il n'a jamais écrit :
+            // `by` JOINT ses jetons avec un espace avant de couper sur les virgules, donc `by code extra`
+            // produit le pseudo-label « code extra ». On rappelle le séparateur attendu.
             let joined = toks[i + 1..].join(" ");
-            bylabels = joined.split(',').map(|s| s.trim().to_string()).collect();
+            bylabels = ByLabels::parse(&joined)
+                .map_err(|bad| format!(
+                    "metric : label invalide dans `by` : « {bad} » (les labels de `by` se séparent par des virgules : `by code,job`)"
+                ))?
+                .into_vec();
             break;
         }
         if let Some((op, num)) = parse_value_filter(toks[i]) {
@@ -654,17 +658,8 @@ fn metric_base(spec: &str, from: i64, to: i64, row_filter: Option<&RowFilter>, d
     let mut selr = "ts,host,avg AS value".to_string();
     let mut ocols: Vec<String> = vec!["ts".into(), "host".into(), "value".into()];
     for l in &bylabels {
-        // S10 — FAIL-CLOSED (même défaut que le filtre de label ci-dessus) : un label de `by` non-identifiant
-        // faisait disparaître le GROUPEMENT en silence -> séries agrégées ensemble au lieu d'être séparées.
-        if !soql_ident_ok(l) {
-            // Le libellé nomme ce que l'UTILISATEUR a écrit, pas un « label » qu'il n'a jamais écrit :
-            // `by` JOINT ses jetons avec un espace avant de couper sur les virgules, donc `by code extra`
-            // produisait le pseudo-label « code extra ». On rappelle le séparateur attendu.
-            let shown = if l.is_empty() { "(vide)" } else { l.as_str() };
-            return Err(format!(
-                "metric : label invalide dans `by` : « {shown} » (les labels de `by` se séparent par des virgules : `by code,job`)"
-            ));
-        }
+        // Les labels sont DÉJÀ validés (`ByLabels::parse`, au jeton `by` ci-dessus) : il ne reste ici
+        // que l'émission.
         sel.push_str(&format!(",{} AS {}", d.json_extract("labels", l), soql_qid(l)));
         selr.push_str(&format!(",{} AS {}", d.json_extract("labels", l), soql_qid(l)));
         ocols.push(l.clone());
@@ -716,39 +711,6 @@ fn soql_glue_spaced_ops(tokens: Vec<SoqlTok>) -> Vec<SoqlTok> {
     out
 }
 
-/// OP 2 (`in` / `not in`) — regex (compilée une fois) qui reconnaît une clause `field [not] in (...)`.
-/// La liste `(a,b,c)` contient des virgules/espaces que `soql_tokenize` casserait : on l'extrait AVANT
-/// le glue/tokenize via un PRÉ-PASS dédié au niveau STRING (cf. `soql_in_collect`). Bornée : la liste
-/// interne `[^()]*` interdit toute parenthèse imbriquée (motif fini, pas de ReDoS).
-///
-/// Le groupe 1 ne décrit PAS le nom par une classe de caractères « autorisés » : il capture tout ce qui
-/// précède `in` JUSQU'À LA FRONTIÈRE RÉELLE d'un jeton (`[^\s(]+` : espace, début de chaîne, ou `(`).
-/// C'est le point clé de sûreté : une classe de caractères se contourne par le caractère suivant —
-/// `[A-Za-z0-9_]` ne retenait que `for` dans `x-forwarded-for`, `[A-Za-z0-9_.-]` ne retenait que `status`
-/// dans `cache/status` ou `host` dans `user@host`, filtrant ainsi un champ que l'utilisateur n'a JAMAIS
-/// nommé (pas un scan plein-texte : un faux négatif silencieux dans une règle de détection). Avec la
-/// frontière, le nom capturé est TOUT le jeton, quel que soit le séparateur employé ; sa validité est
-/// ensuite tranchée par l'appelant (`soql_in_collect` / `soql_parse_in`), qui REFUSE un nom non
-/// identifiant EN LE NOMMANT EN ENTIER. Groupe 2 = `not ` optionnel, groupe 3 = le mot-clé `in`
-/// (sa POSITION sert au test de quotation, cf. `soql_in_collect`), groupe 4 = la liste.
-fn soql_in_re() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"(?i)([^\s(]+)\s+(not\s+)?(in)\s*\(([^()]*)\)").unwrap())
-}
-
-/// CORE-1 : TRUE si l'octet `pos` de `s` tombe À L'INTÉRIEUR d'un littéral entre guillemets (nombre de `"`
-/// AVANT `pos` impair). Même sémantique de guillemet que `soql_tokenize` (`"` bascule l'état, pas d'échappement).
-/// `"` étant ASCII, compter les octets `"` == compter les caractères `"` (jamais un octet de continuation UTF-8) ;
-/// `pos` provenant d'un match regex est une frontière de caractère valide -> `s[..pos]` est sûr.
-fn soql_pos_quoted(s: &str, pos: usize) -> bool {
-    s[..pos].bytes().filter(|&b| b == b'"').count() % 2 == 1
-}
-
-/// Parse les valeurs d'une liste `in (...)` : split sur `,`, trim, retire les guillemets, drop les vides.
-fn soql_in_values(inner: &str) -> Vec<String> {
-    inner.split(',').map(|v| v.trim().trim_matches('"').trim().to_string()).filter(|v| !v.is_empty()).collect()
-}
-
 /// Émet la condition SQL `IN (...)` / `NOT IN (...)` pour un champ FILTRÉ au niveau base. Liste 100 %
 /// numérique -> passe par le chemin `numeric` de `soql_filter_field` (CAST REAL ou forme indexée) et
 /// valeurs INLINE non quotées ; sinon valeurs ÉCHAPPÉES (single-quote, comme les autres filtres).
@@ -786,70 +748,53 @@ fn soql_bad_field_msg(field: &str, term: &str) -> String {
     )
 }
 
-/// PRÉ-PASS `in`/`not in` (cf. `soql_in_re`) : extrait chaque clause `field [not] in (...)` de la chaîne
-/// de filtres, pousse sa condition SQL dans `conds`, et renvoie la chaîne PRIVÉE de ces spans (le reste
-/// suit le chemin de filtre normal : glue + tokenize + split d'opérateurs).
+/// PRÉ-PASS `in`/`not in` : extrait chaque clause `champ [not] in (...)` de la chaîne de filtres,
+/// pousse sa condition SQL dans `conds`, et renvoie la chaîne PRIVÉE de ces spans (le reste suit le
+/// chemin de filtre normal : glue + tokenize + split d'opérateurs). Le nom de champ n'est PAS lu ici :
+/// il est DÉRIVÉ par `InClause` (cf. `helpers.rs`), qui est le seul à savoir ce qu'est le nom.
 fn soql_in_collect(first: &str, base: &BaseDef, conds: &mut Vec<String>, d: &dyn Dialect) -> Result<String, String> {
     // FIELD FILTERS : `soql_in_cond` -> `soql_filter_field` REJETTE un `in (...)` sur un champ masqué (oracle). La
     // closure de `replace_all` ne peut pas court-circuiter -> on capture la 1re erreur et on la propage après.
     let mut err: Option<String> = None;
-    let out = soql_in_re().replace_all(first, |caps: &regex::Captures| {
+    let out = in_clauses_replace(first, |c| {
         if err.is_some() { return String::from(" "); }
-        // CORE-1 : le pré-pass court AVANT le tokenize/quote-handling. Une clause `in` n'est RÉELLE que si
-        // SES DEUX BOUTS — le début du nom (grp 1) ET le mot-clé `in` (grp 3) — sont au niveau quote 0.
-        // Les deux tests sont nécessaires, chacun couvre un cas mesuré que l'autre laisse passer :
-        //  - `message="user in (a,b)"` : le nom capturé commence hors quotes (`message="user`) mais le
-        //    mot-clé `in` est DANS le littéral -> pas une clause, on laisse le span intact et le tokenizer
-        //    en fait l'égalité `message = 'user in (a,b)'`.
-        //  - `"abc def" in (1,2)` : le mot-clé `in` est hors quotes mais le nom (`def"`) commence DANS le
-        //    littéral -> pas une clause non plus : c'est une PHRASE quotée suivie d'un texte libre.
-        // Un vrai `foo in (a,b,c)` — même avec des VALEURS quotées `("a","b")` — a ses deux bouts au
-        // niveau 0 et matche donc toujours.
-        let name_start = caps.get(1).map(|m| m.start()).unwrap_or(0);
-        let in_start = caps.get(3).map(|m| m.start()).unwrap_or(0);
-        if soql_pos_quoted(first, name_start) || soql_pos_quoted(first, in_start) {
-            return caps[0].to_string(); // span verbatim : pas une clause `in`
+        // CORE-1 : le pré-pass court AVANT le tokenize/quote-handling — la clause n'est réelle que si ses
+        // deux bouts sont au niveau de quotation 0 (cf. `InClause::quoted_end`).
+        if c.quoted_end(first) {
+            return c.text().to_string(); // span verbatim : pas une clause `in`
         }
-        // NOM DE CHAMP ENTIER, sinon REFUS. Le groupe 1 s'étend jusqu'à la frontière de jeton (cf.
-        // `soql_in_re`) : un nom mal écrit est refusé EN ENTIER (`cache/status`, `user@host`,
-        // `x-forwarded-for`) au lieu d'être tronqué en un filtre muet sur son dernier segment.
-        let field = &caps[1];
-        if !soql_ident_ok(field) {
-            err = Some(soql_bad_field_msg(field, &caps[0].replace('"', "")));
-            return String::from(" ");
-        }
-        let negate = caps.get(2).is_some();
-        let vals = soql_in_values(&caps[4]);
+        // LE GROUPEMENT N'APPARTIENT PAS À LA CLAUSE : les parenthèses ouvrantes de tête sont REMISES
+        // dans le texte résiduel, où elles repartent en terme libre exactement comme avant ce correctif
+        // (`search (foo in (1,2))` -> `… IN (1,2) AND message LIKE '%(%' AND message LIKE '%)%'`).
+        let keep = format!("{} ", c.grouping());
+        // NOM DE CHAMP ENTIER, sinon REFUS : `InClause::field` rend le nom réclamé (jeton entier moins
+        // le groupement de tête) ou le texte à refuser EN LE NOMMANT EN ENTIER (`cache/status`,
+        // `user@host`, `foo(host`) au lieu de le tronquer en un filtre muet sur son dernier segment.
+        let field = match c.field() {
+            Ok(f) => f,
+            Err(bad) => {
+                err = Some(soql_bad_field_msg(bad, &c.text().replace('"', "")));
+                return String::from(" ");
+            }
+        };
+        let vals = c.values();
         if vals.is_empty() {
             // CORE-4 : liste VIDE (`in ()` / `in (,,)`). SQLite refuse `x IN ()` (erreur de parse) -> on ne
             // peut pas l'émettre littéralement. Une liste vide = ensemble d'appartenance vide : `in` -> FAUX
             // partout (`1=0`), `not in` -> VRAI partout (`1=1`). JAMAIS un filtre ÉVANOUI (qui renverrait tout).
-            conds.push(if negate { "1=1".to_string() } else { "1=0".to_string() });
-            return String::from(" ");
+            conds.push(if c.negate() { "1=1".to_string() } else { "1=0".to_string() });
+            return keep;
         }
-        match soql_in_cond(field, negate, &vals, base, d) {
-            Ok(c) => conds.push(c),
+        match soql_in_cond(field, c.negate(), &vals, base, d) {
+            Ok(cond) => conds.push(cond),
             Err(e) => err = Some(e),
         }
-        String::from(" ")
-    }).into_owned();
+        keep
+    });
     match err {
         Some(e) => Err(e),
         None => Ok(out),
     }
-}
-
-/// Parse une clause `in`/`not in` couvrant l'INTÉGRALITÉ de `expr` (pour l'étape `where`). Renvoie
-/// `(field, negate, vals)` si tout `expr` est exactement une telle clause, sinon `None` (-> chemin
-/// `where` normal `champ op valeur`).
-fn soql_parse_in(expr: &str) -> Option<(String, bool, Vec<String>)> {
-    let e = expr.trim();
-    let caps = soql_in_re().captures(e)?;
-    let m = caps.get(0)?;
-    if m.start() != 0 || m.end() != e.len() { return None; } // match partiel -> pas une clause `in` pure
-    let vals = soql_in_values(caps.get(4)?.as_str());
-    if vals.is_empty() { return None; }
-    Some((caps.get(1)?.as_str().to_string(), caps.get(2).is_some(), vals))
 }
 
 /// Construit la LISTE des conditions WHERE d'un FILTRE de base (pré-pass `in`/`not in`, glue/tokenize, boucle
@@ -1136,20 +1081,19 @@ pub fn compile_with_time(soql: &str, from: i64, to: i64, schema: &Schema) -> Res
     Ok(Compiled { sql, columns })
 }
 
-/// Parse une liste `by <f1,f2,...>` (déjà jointe en une chaîne), valide chaque identifiant
-/// (`soql_ident_ok`, préfixe d'erreur `label`) et construit les fragments d'émission PARTAGÉS par
-/// `stats`/`timechart` (et le parse+validation de `eventstats`) :
+/// Parse une liste `by <f1,f2,...>` (déjà jointe en une chaîne) et construit les fragments d'émission
+/// PARTAGÉS par `stats`/`timechart` (et le parse+validation de `eventstats`) :
 /// - `fields` : les noms validés (deviennent des colonnes de sortie / clés GROUP BY) ;
 /// - `sel`    : `["<soql_field> AS <qid>", ...]` (projection des champs de groupe) ;
 /// - `gcols`  : les identifiants quotés joints par `,` (clause GROUP BY).
-/// VERBATIM : mêmes appels `soql_field`/`soql_qid` et même ordre qu'avant l'extraction (parité stricte).
+///
+/// LA VALIDITÉ DE LA LISTE N'EST PAS DÉCIDÉE ICI : `ByLabels::parse` la décide pour les QUATRE étapes
+/// qui prennent un `by` (les trois d'ici + `metric`), cf. le bandeau de `helpers.rs`. Cette fonction ne
+/// fabrique plus que l'émission ; `label` est le préfixe d'erreur propre à l'étape.
 fn by_fields(raw: &str, label: &str, ocols: &[String], jf: Option<&str>, d: &dyn Dialect) -> Result<(Vec<String>, Vec<String>, String), String> {
-    let fields: Vec<String> = raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    for f in &fields {
-        if !soql_ident_ok(f) {
-            return Err(format!("{label}champ invalide : {f}"));
-        }
-    }
+    let fields: Vec<String> = ByLabels::parse(raw)
+        .map_err(|bad| format!("{label}champ invalide : {bad}"))?
+        .into_vec();
     let sel: Vec<String> = fields.iter().map(|f| format!("{} AS {}", soql_field(f, ocols, jf, d), soql_qid(f))).collect();
     let gcols = fields.iter().map(|f| soql_qid(f)).collect::<Vec<_>>().join(",");
     Ok((fields, sel, gcols))

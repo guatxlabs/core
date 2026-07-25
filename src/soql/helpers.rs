@@ -79,6 +79,14 @@ impl SoqlTok {
     /// jamais : un terme qui en contient ne peut pas être re-quoté tel quel (SOQL n'a pas
     /// d'échappement). Que re-jouer la suggestion rende bien un plein-texte SUR CE TEXTE est MESURÉ
     /// (`s11_error_suggestion_is_the_users_own_text`), pas déduit.
+    ///
+    /// PORTÉE EXACTE, MESURÉE ET NON UNIVERSELLE (contre-exemples relevés sur 400 suggestions tirées
+    /// d'un corpus adverse, IDENTIQUES sur le tag public v0.2.0 — limite pré-existante, pas une
+    /// conséquence de la garde) : 389 rendent bien `message LIKE '%<ce texte>%'` ; les 11 autres
+    /// rendent une ÉGALITÉ/COMPARAISON, parce que le texte suggéré commence lui-même par un
+    /// identifiant VALIDE suivi d'un opérateur (`b: not in ()` -> `$.b = ' not in ()'`,
+    /// `source=web … In ()` -> `"source" = 'web … In ()'`). Le texte reste celui de l'utilisateur ;
+    /// c'est sa RELECTURE qui diffère, et elle suit le chemin quoté historique à l'octet près.
     pub(crate) fn source_unquoted(&self, src: &str) -> String {
         src[self.beg..self.end].replace('"', "")
     }
@@ -160,6 +168,211 @@ pub(crate) fn soql_fieldish(s: &str) -> bool {
     let mut cs = s.chars();
     matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+// ---------------------------------------------------------------------------------------------
+// CLAUSE `champ [not] in (…)` — LE SEUL ENDROIT OÙ SON NOM DE CHAMP EST OBTENU.
+//
+// POURQUOI UN TYPE, ET PAS UNE REGEX PARTAGÉE. Deux étapes reconnaissent cette clause (le pré-pass
+// du filtre de base, l'étape `where`). Tant que chacune lisait le groupe 1 d'une regex commune, la
+// question « quel champ cette clause réclame-t-elle ? » se posait EN DEHORS de la définition de la
+// clause, et un troisième appelant l'aurait posée à sa façon. Ici la regex et ses groupes sont
+// PRIVÉS au module : un appelant reçoit un `InClause` dont TOUS les champs sont privés, et le seul
+// accès au nom est `InClause::field()`, qui décide. Poser la question autrement ne compile pas.
+// ---------------------------------------------------------------------------------------------
+
+/// Grammaire de la clause. Groupe 1 = le JETON qui précède `in` — `[^\s]+`, c'est-à-dire jusqu'au
+/// BLANC : la frontière de jeton que `soql_tokenize_marked` applique, et la seule de ce langage.
+/// AUCUN caractère n'est déclaré « autorisé au milieu d'un nom » ni exclu du jeton. Groupe 2 =
+/// `not ` optionnel ; groupe 3 = le mot-clé `in` (sa POSITION sert au test de quotation) ; groupe 4
+/// = le DÉLIMITEUR OUVRANT de la liste ; groupe 5 = l'intérieur de la liste. `[^()]*` interdit
+/// l'imbrication (motif fini, pas de ReDoS).
+fn in_clause_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?i)([^\s]+)\s+(not\s+)?(in)\s*(\()([^()]*)\)").unwrap())
+}
+
+/// TRUE si l'octet `pos` de `s` tombe À L'INTÉRIEUR d'un littéral entre guillemets (nombre de `"`
+/// AVANT `pos` impair). Même sémantique de guillemet que `soql_tokenize_marked` (`"` bascule l'état,
+/// pas d'échappement). `"` étant ASCII, compter les octets `"` == compter les caractères `"` (jamais
+/// un octet de continuation UTF-8) ; `pos` provient d'un match regex, donc c'est une frontière de
+/// caractère valide -> `s[..pos]` est sûr.
+fn quote_level_odd(s: &str, pos: usize) -> bool {
+    s[..pos].bytes().filter(|&b| b == b'"').count() % 2 == 1
+}
+
+/// UNE clause `champ [not] in (…)` reconnue dans un texte de filtre. Champs PRIVÉS (cf. bandeau).
+pub(crate) struct InClause<'a> {
+    /// Le texte complet de la clause, tel qu'il a été tapé (préfixe de groupement compris).
+    text: &'a str,
+    /// Le JETON qui précède `in`, tel qu'il a été tapé.
+    token: &'a str,
+    /// Le préfixe de GROUPEMENT retiré de la tête du jeton (cf. `field`).
+    grouping: &'a str,
+    /// Le nom RÉCLAMÉ : le jeton MOINS son préfixe de groupement. Validé par `field()`, jamais lu ailleurs.
+    claimed: &'a str,
+    /// Les deux bouts de la clause dont le NIVEAU DE QUOTATION décide qu'elle est réelle (cf. `quoted_end`).
+    token_start: usize,
+    kw_start: usize,
+    negate: bool,
+    /// L'intérieur de la liste, brut.
+    list: &'a str,
+}
+
+impl<'a> InClause<'a> {
+    /// Construit la clause à partir d'un match. LE NOM EST DÉRIVÉ ICI, EN DEUX TEMPS :
+    ///  1. LA FRONTIÈRE — le jeton va jusqu'au blanc (groupe 1), donc le nom réclamé est TOUT le
+    ///     jeton. Rien n'est énuméré comme « autorisé au milieu d'un nom ».
+    ///  2. LE GROUPEMENT — une répétition du délimiteur OUVRANT DE LA LISTE DE CETTE CLAUSE
+    ///     (groupe 4, LU dans le match, pas écrit ici) en TÊTE du jeton n'appartient à aucun nom :
+    ///     c'est du groupement. Elle est retirée EN TÊTE seulement, jamais au milieu, et réémise
+    ///     verbatim par l'appelant (`grouping()`), donc rien du texte de l'utilisateur ne disparaît.
+    ///
+    /// Le reste doit être un identifiant ENTIER (`soql_ident_ok`, cf. `field`).
+    fn from_caps(caps: &regex::Captures<'a>) -> InClause<'a> {
+        let token = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let open = caps.get(4).map(|m| m.as_str()).unwrap_or("");
+        let mut cut = 0usize;
+        while !open.is_empty() && token[cut..].starts_with(open) {
+            cut += open.len();
+        }
+        InClause {
+            text: caps.get(0).map(|m| m.as_str()).unwrap_or(""),
+            token,
+            grouping: &token[..cut],
+            claimed: &token[cut..],
+            token_start: caps.get(1).map(|m| m.start()).unwrap_or(0),
+            kw_start: caps.get(3).map(|m| m.start()).unwrap_or(0),
+            negate: caps.get(2).is_some(),
+            list: caps.get(5).map(|m| m.as_str()).unwrap_or(""),
+        }
+    }
+
+    /// LE NOM DE CHAMP QUE CETTE CLAUSE RÉCLAME, ou le texte à REFUSER EN LE NOMMANT EN ENTIER.
+    ///
+    /// C'est le seul accès au nom : les champs sont privés, donc aucun appelant — présent ou futur —
+    /// ne peut prendre un fragment du jeton pour un nom de champ. Conséquence dérivée : tout
+    /// caractère situé ailleurs qu'en tête de groupement rend le jeton non identifiant et REFUSE la
+    /// clause, y compris un caractère que ce code ne nomme nulle part. La seule erreur possible par
+    /// omission est donc un REFUS, jamais un filtre sur un champ que l'utilisateur n'a pas nommé.
+    pub(crate) fn field(&self) -> Result<&'a str, &'a str> {
+        if soql_ident_ok(self.claimed) {
+            Ok(self.claimed)
+        } else if self.claimed.is_empty() {
+            Err(self.token) // rien après le groupement : on nomme ce qui a été tapé
+        } else {
+            Err(self.claimed)
+        }
+    }
+
+    /// Le préfixe de GROUPEMENT du jeton. L'appelant le RÉÉMET dans le texte résiduel : il n'est pas
+    /// consommé par la clause, il appartient au reste du filtre.
+    pub(crate) fn grouping(&self) -> &'a str {
+        self.grouping
+    }
+
+    /// Le texte de la clause, tel qu'il a été tapé (échappatoire suggérée à l'utilisateur).
+    pub(crate) fn text(&self) -> &'a str {
+        self.text
+    }
+
+    pub(crate) fn negate(&self) -> bool {
+        self.negate
+    }
+
+    /// Valeurs de la liste : split sur `,`, trim, retrait des guillemets, vides jetées.
+    pub(crate) fn values(&self) -> Vec<String> {
+        self.list.split(',').map(|v| v.trim().trim_matches('"').trim().to_string()).filter(|v| !v.is_empty()).collect()
+    }
+
+    /// CORE-1 : une clause n'est RÉELLE que si SES DEUX BOUTS — le début du jeton ET le mot-clé `in` —
+    /// sont au niveau de quotation 0 dans `src`. Les deux tests sont nécessaires, chacun couvre un cas
+    /// mesuré que l'autre laisse passer :
+    ///  - `message="user in (a,b)"` : le jeton commence hors quotes (`message="user`) mais le mot-clé
+    ///    est DANS le littéral -> pas une clause : le tokenizer en fait l'égalité `message = '…'`.
+    ///  - `"abc def" in (1,2)` : le mot-clé est hors quotes mais le jeton (`def"`) commence DEDANS ->
+    ///    pas une clause non plus : c'est une PHRASE quotée suivie de texte libre.
+    pub(crate) fn quoted_end(&self, src: &str) -> bool {
+        quote_level_odd(src, self.token_start) || quote_level_odd(src, self.kw_start)
+    }
+}
+
+/// Reconnaît chaque clause `in` de `src` et remplace son texte par ce que rend `f`. La regex et ses
+/// groupes ne sortent JAMAIS d'ici : `f` ne reçoit qu'un `InClause`.
+pub(crate) fn in_clauses_replace(src: &str, mut f: impl FnMut(InClause<'_>) -> String) -> String {
+    in_clause_re()
+        .replace_all(src, |caps: &regex::Captures| f(InClause::from_caps(caps)))
+        .into_owned()
+}
+
+/// La clause qui couvre `expr` EN ENTIER, groupement compris — pour l'étape `where`, qui n'a pas de
+/// grammaire de groupement (mesuré : `where (count > 5)` est refusé, et l'était déjà). Un préfixe de
+/// groupement signifie donc qu'il reste de la structure que `where` ne sait pas lire : ce n'est pas
+/// une clause pure, et l'expression repart sur le chemin `champ op valeur`. Une liste VIDE non plus
+/// (`in ()`) : le `where` scalaire la traite comme avant.
+pub(crate) fn in_clause_whole(expr: &str) -> Option<(String, bool, Vec<String>)> {
+    let caps = in_clause_re().captures(expr)?;
+    let m = caps.get(0)?;
+    if m.start() != 0 || m.end() != expr.len() {
+        return None;
+    }
+    let c = InClause::from_caps(&caps);
+    if !c.grouping().is_empty() {
+        return None;
+    }
+    let vals = c.values();
+    if vals.is_empty() {
+        return None;
+    }
+    // `where` valide lui-même le nom (libellé propre, sans suggestion) : on lui rend le nom RÉCLAMÉ,
+    // valide ou non, et jamais un fragment de jeton.
+    let field = match c.field() {
+        Ok(f) => f,
+        Err(bad) => bad,
+    };
+    Some((field.to_string(), c.negate(), vals))
+}
+
+// ---------------------------------------------------------------------------------------------
+// LISTE DE LABELS D'UN `by` — UN SEUL ENDROIT DÉCIDE DE SA VALIDITÉ.
+//
+// Quatre étapes prennent un `by` (`stats`, `timechart`, `eventstats` via `by_fields` ; `metric` via
+// `metric_base`). Tant que chacune découpait la chaîne elle-même, la correction d'un `by` corrigeait
+// UNE étape : le `.filter(|s| !s.is_empty())` retiré de `metric_base` est resté dans `by_fields`, et
+// les trois étapes qui en dépendent ont continué à JETER les labels vides — `stats count by` émettait
+// `SELECT ,COUNT(*) … GROUP BY ` (SQL invalide) et `timechart … by ,` perdait le regroupement demandé
+// sans un mot. Le champ est PRIVÉ : la seule façon d'obtenir une liste de labels est `ByLabels::parse`.
+// ---------------------------------------------------------------------------------------------
+
+/// Le label qui a fait refuser un `by`. `Display` rend `(vide)` pour un label vide : un message qui
+/// nomme le vide par une chaîne vide ne dit rien à l'utilisateur.
+pub(crate) struct BadByLabel(String);
+
+impl std::fmt::Display for BadByLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_empty() { "(vide)" } else { self.0.as_str() })
+    }
+}
+
+/// Les labels d'un `by`, VALIDÉS. Champ privé : impossible d'en fabriquer une hors de `parse`.
+pub(crate) struct ByLabels(Vec<String>);
+
+impl ByLabels {
+    /// `raw` = tout ce qui suit `by`, jetons joints par un espace. AUCUN LABEL N'EST JETÉ : la liste
+    /// est rendue telle quelle à `soql_ident_ok`, qui tranche — et lui seul. `by` NU donne
+    /// `"".split(',')` = UN label vide, refusé comme les autres : aucun cas particulier à écrire, et
+    /// aucun `by` demandé ne peut s'évaporer en silence.
+    pub(crate) fn parse(raw: &str) -> Result<ByLabels, BadByLabel> {
+        let labels: Vec<String> = raw.split(',').map(|s| s.trim().to_string()).collect();
+        match labels.iter().find(|l| !soql_ident_ok(l)) {
+            Some(bad) => Err(BadByLabel(bad.clone())),
+            None => Ok(ByLabels(labels)),
+        }
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<String> {
+        self.0
+    }
 }
 
 /// Échappe une valeur pour un littéral chaîne SQL (doublage des `'`). PUBLIC (cf. `soql_tokenize`).
@@ -423,8 +636,13 @@ pub(crate) fn soql_expr_sql(expr: &str, json_field: Option<&str>, cols: &[String
             } else if soql_ident_ok(&id) {
                 // LIMITE ASSUMÉE ET MESURÉE — la garde de nom de champ de `table_conds` n'a PAS
                 // d'équivalent ici, et ne peut pas en avoir : dans une EXPRESSION, `-` est l'opérateur
-                // de soustraction. `search | eval x = foo-bar` rend `(foo-bar)` — mesuré — c'est-à-dire
-                // exactement le SQL de `eval x = foo - bar`, et l'entrée ne porte AUCUNE information qui
+                // de soustraction. `search | eval x = foo-bar` rend `(foo-bar)` et
+                // `eval x = foo - bar` rend `(foo - bar)` : ces deux SQL ne sont PAS identiques à
+                // l'octet (ils ne diffèrent QUE par des blancs — mesuré, cf.
+                // `eval_is_the_documented_blind_spot_of_the_field_name_guard`), mais SQLite les compile
+                // en le MÊME programme (mesuré : `EXPLAIN SELECT (foo-bar) FROM t` et
+                // `EXPLAIN SELECT (foo - bar) FROM t` rendent un bytecode identique, sqlite 3.53.3).
+                // L'entrée ne porte donc AUCUNE information qui
                 // distingue « nom de champ mal écrit » de « soustraction de deux champs » (`severity-1`
                 // est légitime et s'écrit sans blancs). Refuser `a-b` casserait l'arithmétique ; refuser
                 // un identifiant inconnu casserait `eval x = dport * 2` sur une clé JSON, qui n'est pas
