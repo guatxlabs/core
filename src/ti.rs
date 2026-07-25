@@ -1,7 +1,8 @@
 //! Threat-Intelligence core — PURE, injection-safe translation of STIX 2.1 `indicator`
 //! objects into Plume IOC rows, plus IOC value normalization. Mirrors the discipline of the Sigma
 //! importer (daemon side): a construct that cannot be translated FAITHFULLY is SKIPPED WITH A
-//! REASON (never emitted as an IOC that would over- or under-match silently).
+//! REASON, so that it is not emitted as an IOC that would over- or under-match silently. This holds
+//! for every construct listed below; it is NOT an unconditional guarantee — see KNOWN GAP.
 //!
 //! DESIGN — vendor-agnostic & shared. This module is `serde_json`-only (zero rusqlite, zero I/O), so
 //! both Plume (blue SOC) and the Forge console can consume the same STIX front-end. The daemon owns the
@@ -21,6 +22,14 @@
 //! match -> reducing to one field over-matches), multi-observation operators (FOLLOWEDBY / WITHIN /
 //! REPEATS), non-equality operators (`!=`, `<`, `>`, LIKE, MATCHES, IN, ISSUBSET/ISSUPERSET),
 //! unsupported object paths / hash algorithms, and non-`stix` pattern types.
+//!
+//! KNOWN GAP (measured, not closed here): the denylist above has no entry for the `START ... STOP ...`
+//! observation qualifier, so
+//!   `[url:value='http://evil/x'] START t'2020-01-01T00:00:00Z' STOP t'2021-01-01T00:00:00Z'`
+//! parses to a bare `url` IOC and its validity window is dropped without a word — the IOC then matches
+//! OUTSIDE the window its author declared. Measured identical before and after the token-denylist
+//! change, i.e. long-standing and not a regression, but it is a real over-match and no test below
+//! covers it. Documented rather than silently implied to be handled.
 
 use serde_json::Value;
 
