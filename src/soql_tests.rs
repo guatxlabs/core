@@ -2210,6 +2210,71 @@
     }
 
     #[test]
+    fn a_comma_list_of_field_names_never_drops_an_entry_whatever_the_step() {
+        // LE MÊME DÉFAUT, DANS LES ÉTAPES QUE `by` NE COUVRE PAS — c'est-à-dire l'élément suivant de
+        // la liste, trouvé et fermé ici plutôt que laissé au relecteur. Le `.filter(|s| !s.is_empty())`
+        // vivait aussi dans `compile_fields` et `compile_dedup`. MESURÉ avant ce correctif (et sur le
+        // tag public 48035b9, donc pré-existant) :
+        //   search | fields          -> SELECT  FROM (…)     <- SQL SYNTAXIQUEMENT INVALIDE émis
+        //   search | fields ,        -> idem
+        //   search | fields ,src_ip  -> entrée vide jetée sans un mot
+        //   search | dedup ,src_ip   -> idem
+        //   search | table ,         -> l'étape s'évapore (base rendue inchangée)
+        // Les listes séparées par des VIRGULES SEULES passent toutes par `FieldList::commas` ; `table`,
+        // dont la grammaire admet aussi le BLANC, par `FieldList::commas_or_blanks`.
+        let ev = Schema::events();
+        let mut leaks: Vec<String> = Vec::new();
+        for (stage, tpl) in [
+            ("fields", "search | fields {}"),
+            ("dedup", "search | dedup {}"),
+        ] {
+            for shape in ["", ",", ",,", ",src_ip", "src_ip,", "src_ip,,host"] {
+                let q = tpl.replace("{}", shape);
+                if let Ok(sql) = to_sql(&q, 0, 0, &ev) {
+                    leaks.push(format!("[{stage}] « {q} » a compilé : {sql}"));
+                }
+            }
+        }
+        // `table` : une liste qui ne contient QUE des séparateurs ne peut plus s'évaporer.
+        for shape in [",", ",,", ", ,"] {
+            let q = format!("search | table {shape}");
+            if let Ok(sql) = to_sql(&q, 0, 0, &ev) {
+                leaks.push(format!("[table] « {q} » a compilé : {sql}"));
+            }
+        }
+        assert!(leaks.is_empty(), "une entrée demandée s'est évaporée :\n{}", leaks.join("\n"));
+
+        // CONTRE-PREUVE — les formes légitimes rendent le SQL du tag public v0.2.0, goldens littéraux
+        // (probe sur 48035b9 vs cet arbre : 0 ligne de différence sur 160 requêtes réelles).
+        let b = "SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event";
+        for (q, want) in [
+            ("search | fields src_ip", format!("SELECT \"src_ip\" AS \"src_ip\" FROM ({b})")),
+            ("search | fields src_ip, host", format!("SELECT \"src_ip\" AS \"src_ip\",\"host\" AS \"host\" FROM ({b})")),
+            ("search | dedup src_ip", format!("SELECT * FROM ({b}) GROUP BY \"src_ip\"")),
+            ("search | dedup src_ip, host", format!("SELECT * FROM ({b}) GROUP BY \"src_ip\",\"host\"")),
+            ("search | table src_ip,host", format!("SELECT \"src_ip\" AS \"src_ip\",\"host\" AS \"host\" FROM ({b})")),
+            // `table` accepte le BLANC comme séparateur — c'est ce qui force la réduction des suites.
+            ("search | table src_ip host", format!("SELECT \"src_ip\" AS \"src_ip\",\"host\" AS \"host\" FROM ({b})")),
+            ("search | table src_ip, host", format!("SELECT \"src_ip\" AS \"src_ip\",\"host\" AS \"host\" FROM ({b})")),
+        ] {
+            assert_eq!(to_sql(q, 0, 0, &ev).unwrap(), want, "liste légitime réécrite : {q}");
+        }
+        // LIMITE ASSUMÉE ET MESURÉE, écrite ici plutôt que laissée à découvrir : dans `table`, une
+        // suite de séparateurs est INDISCERNABLE d'un seul (`a, b` / `a,b` / `a  b` sont la même
+        // écriture), donc `table a,,b` rend `a` et `b`. Dans les listes à virgules SEULES, la même
+        // écriture est refusée — parce que là, elle est discernable.
+        assert_eq!(
+            to_sql("search | table src_ip,,host", 0, 0, &ev).unwrap(),
+            format!("SELECT \"src_ip\" AS \"src_ip\",\"host\" AS \"host\" FROM ({b})")
+        );
+        to_sql("search | fields src_ip,,host", 0, 0, &ev).expect_err("virgules seules : entrée vide refusée");
+        // Et les deux passe-plat DÉLIBÉRÉS de `table` restent intacts (contrat existant).
+        for q in ["search | table *", "search | table"] {
+            assert_eq!(to_sql(q, 0, 0, &ev).unwrap(), b, "passe-plat cassé : {q}");
+        }
+    }
+
+    #[test]
     fn s10_metric_by_error_explains_the_comma_separator() {
         // Le message « label invalide dans `by` : code extra » était bancal : `by` JOINT ses jetons avec
         // un espace, donc l'utilisateur qui écrit `by code extra` lit un « label » qu'il n'a pas écrit.
