@@ -660,17 +660,33 @@ fn metric_base(spec: &str, from: i64, to: i64, row_filter: Option<&RowFilter>, d
 /// Re-colle un filtre `champ op valeur` éclaté par des espaces (`source = "x"` -> `source="x"`),
 /// pour tolérer la syntaxe SQL habituelle. Fusionne `<ident> <op…>` et tout jeton finissant par un
 /// opérateur (= : ! < > ~) avec le jeton suivant. Un terme libre sans opérateur reste intact.
-fn soql_glue_spaced_ops(tokens: Vec<String>) -> Vec<String> {
+/// Chaque jeton porte son marqueur « était quoté » (cf. `soql_tokenize_marked`) ; un jeton FUSIONNÉ
+/// hérite du marqueur de son PREMIER fragment (c'est lui qui porte le nom de champ prétendu).
+fn soql_glue_spaced_ops(tokens: Vec<(String, bool)>) -> Vec<(String, bool)> {
     fn is_op(c: char) -> bool { matches!(c, '=' | ':' | '!' | '<' | '>' | '~') }
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<(String, bool)> = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
-        let mut t = tokens[i].clone();
+        let (mut t, quoted) = tokens[i].clone();
         i += 1;
         let bare = !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if bare && i < tokens.len() && tokens[i].starts_with(is_op) { t.push_str(&tokens[i]); i += 1; }
-        if t.ends_with(is_op) && i < tokens.len() { t.push_str(&tokens[i]); i += 1; }
-        out.push(t);
+        // ÉTAGE 2 DE LA GARDE DE NOM DE CHAMP. `bare` (identifiant nu) ne recollait que les noms
+        // VALIDES : un nom mal écrit restait éclaté en deux jetons et repartait en DEUX scans
+        // plein-texte, contournant la garde de `table_conds` au prix d'un espace. Mesuré avant :
+        // `search foo-bar = 1` -> `message LIKE '%foo-bar%' AND message LIKE '%=1%'`.
+        // On recolle donc aussi un nom en FORME de champ (`soql_fieldish`) — mais JAMAIS un jeton
+        // QUOTÉ : entre guillemets, l'analyste écrit une phrase, pas un nom de champ, et son jeton
+        // doit suivre le chemin historique à l'octet près.
+        let gluable = bare || (!quoted && soql_fieldish(&t));
+        if gluable && i < tokens.len() && tokens[i].0.starts_with(is_op) {
+            t.push_str(&tokens[i].0);
+            i += 1;
+        }
+        if t.ends_with(is_op) && i < tokens.len() {
+            t.push_str(&tokens[i].0);
+            i += 1;
+        }
+        out.push((t, quoted));
     }
     out
 }
@@ -829,7 +845,7 @@ fn table_conds(first: &str, base: &BaseDef, d: &dyn Dialect, ko_depth: u32) -> R
     } else {
         first
     };
-    for tk in soql_glue_spaced_ops(soql_tokenize(first)) {
+    for (tk, quoted) in soql_glue_spaced_ops(soql_tokenize_marked(first)) {
         // KNOWLEDGE OBJECTS : `eventtype=NOM` / `tag=LABEL` DÉTENDUS ici (précèdent field=value). Scope
         // KO sans eventtype/tag -> `None` -> jeton traité normalement (mode 0 byte-identique).
         if let Some(cond) = ko_special_token(&tk, base, d, ko_depth)? {
@@ -848,17 +864,18 @@ fn table_conds(first: &str, base: &BaseDef, d: &dyn Dialect, ko_depth: u32) -> R
             if let Some(pos) = tk.find(op) {
                 let field = &tk[..pos];
                 let val = &tk[pos + op.len()..];
-                // S11 — FAIL-CLOSED. Un jeton qui PRÉTEND nommer un champ (partie gauche en FORME
-                // d'identifiant : `x-forwarded-for`, `http.status`) mais dont le nom n'est pas un
-                // identifiant valide tombait dans la branche terme-libre : `message LIKE '%foo-bar=1%'`
-                // -> scan plein-texte NON BORNÉ à la place d'un filtre indexé, et surtout un JEU DE LIGNES
-                // DIFFÉRENT de celui demandé (faux négatif MUET dans une règle de détection). On refuse
-                // explicitement. Un VRAI terme libre (phrase quotée, horodatage, chemin/URL — partie gauche
-                // qui n'a pas la forme d'un nom de champ) garde le chemin LIKE, inchangé.
-                if !soql_ident_ok(field) && soql_fieldish(field) {
-                    return Err(format!(
-                        "champ invalide dans le filtre : {field} (un nom de champ n'accepte que lettres, chiffres et « _ »)"
-                    ));
+                // ÉTAGE 3 DE LA GARDE DE NOM DE CHAMP — FAIL-CLOSED. Un jeton NON QUOTÉ qui PRÉTEND
+                // nommer un champ (partie gauche en FORME d'identifiant : `x-forwarded-for`,
+                // `http.status`) mais dont le nom n'est pas un identifiant valide tombait dans la
+                // branche terme-libre : `message LIKE '%foo-bar=1%'` -> scan plein-texte NON BORNÉ à la
+                // place d'un filtre indexé, et surtout un JEU DE LIGNES DIFFÉRENT de celui demandé
+                // (faux négatif MUET dans une règle de détection). On refuse explicitement.
+                // EXEMPTION MESURÉE : un jeton QUOTÉ est une PHRASE, pas un nom de champ — l'analyste a
+                // écrit `search "user-agent=curl/7.68"`. Sans le marqueur de `soql_tokenize_marked`, la
+                // garde refusait ces phrases (6 formes réalistes mesurées) : c'était une régression, pas
+                // une protection. Quoté -> chemin LIKE historique, à l'octet près.
+                if !quoted && !soql_ident_ok(field) && soql_fieldish(field) {
+                    return Err(soql_bad_field_msg(field, &tk));
                 }
                 if soql_ident_ok(field) {
                     let fstr = soql_filter_field(field, false, base, d)?; // FIELD FILTERS : rejet si champ masqué (oracle)
