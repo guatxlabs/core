@@ -36,19 +36,50 @@ let c = compile("search severity=HIGH | stats count by mitre | sort -count", &Sc
 // délégué au `Dialect` de la cible (SQLite/DuckDB/ClickHouse), c'est le point d'étranglement unique.
 ```
 ```sh
-cargo test                   # 139 tests (133 unitaires + 5 parité différentielle + 1 doctest)
-cargo test --features forge  # 159 tests (schéma + tests Forge activés)
-cargo test --all-features    # 168 tests (+ modules `ai` et `cold_tier`)
+cargo test                   # 150 tests (144 unitaires + 5 parité différentielle + 1 doctest)
+cargo test --features forge  # 170 tests (schéma + tests Forge activés)
+cargo test --all-features    # 179 tests (+ modules `ai` et `cold_tier`)
 ```
 
 ### Nom de champ et recherche plein-texte
-Un nom de champ n'accepte que **lettres, chiffres et `_`**. Un jeton non quoté dont la partie gauche a
-la *forme* d'un nom de champ mais n'en est pas un valide (`x-forwarded-for=1.2.3.4`, `http.status>=500`,
-`src-ip in (10,11)`, y compris sous la forme espacée `foo-bar = 1`) est **refusé** : le laisser filer
-donnerait un scan plein-texte non borné — ou, pour `in (...)`, un filtre sur un *autre* champ — c'est-à-dire
-un jeu de lignes différent de celui demandé, sans un mot. Pour chercher un tel texte, **mettez-le entre
-guillemets** : `search "x-forwarded-for=1.2.3.4"` reste une recherche plein-texte, à l'identique. Une
-phrase quotée n'est jamais lue comme un nom de champ.
+Un nom de champ n'accepte que **lettres, chiffres et `_`**.
+
+**Ce qui est refusé.** Dans un filtre de base (`search …`) ou un `where`, un terme dont la **partie
+gauche** a la *forme* d'un nom de champ sans en être un valide est **refusé**, avec un message qui
+nomme cette partie gauche. Sont concernées les deux syntaxes de filtre :
+
+| Syntaxe | Ce qui décide du nom | Refusé |
+|---|---|---|
+| jeton `nom<op>valeur` (`=` `:` `!=` `>=` `<=` `>` `<` `=~`), collé ou espacé | la partie gauche de l'opérateur, blancs délimiteurs retirés | `x-forwarded-for=1.2.3.4` · `http.status>=500` · `foo-bar = 1` · `x-forwarded-for="10.0.0.1"` (guillemeter la *valeur* n'exempte pas) |
+| clause `nom [not] in (…)` | tout ce qui précède `in` jusqu'à la frontière du jeton (espace, début, `(`) — **pas** une classe de caractères | `src-ip in (10,11)` · `cache/status in (200,302)` · `user@host in (1,2)` · `-foo in (1,2)` |
+
+Le laisser filer donnerait un scan plein-texte non borné — ou, pour `in (…)`, un filtre sur un *autre*
+champ que celui écrit (le suffixe après le séparateur) : dans les deux cas un jeu de lignes différent
+de celui demandé, sans un mot. La garde vaut aux mêmes conditions dans une sous-recherche
+(`append […]`, `join f […]`), à toute profondeur.
+
+**Ce qui n'est PAS refusé.** Une **phrase quotée** reste une recherche plein-texte, inchangée :
+`search "user-agent=curl/7.68"`, `search "x-forwarded-for in (1,2)"`, `search "foo-bar"=1`. La
+quotation compte pour ce qu'elle couvre à **gauche de l'opérateur**, pas pour le fait qu'il y ait un
+guillemet quelque part : `search source="web"` reste le filtre indexé `"source" = 'web'`, et
+`search x-forwarded-for="10.0.0.1"` est refusé. Une quotation **non close** n'exempte rien.
+
+**L'échappatoire.** Dans un **filtre de base**, le message d'erreur suggère votre propre texte entre
+guillemets — c'est une tranche du texte que vous avez tapé, espaces et ponctuation compris. Mesuré :
+`search foo-bar = 1` suggère `"foo-bar = 1"`, et `search "foo-bar = 1"` compile en
+`message LIKE '%foo-bar = 1%'`. Les guillemets étant des **délimiteurs** (le tokenizer ne les conserve
+jamais), le texte suggéré est le vôtre *sans ses guillemets internes* : `search foo-bar=a"b"` suggère
+`"foo-bar=ab"`. L'étape `where` refuse elle aussi un nom invalide, mais avec son libellé propre et
+**sans** suggestion (`where : champ invalide : foo-bar` — mesuré) : `where` n'a pas de recherche
+plein-texte vers laquelle se rabattre.
+
+**Limite mesurée, non fermée :** cette garde n'existe pas dans `eval`, et ne peut pas y exister — dans
+une expression, `-` est l'opérateur de soustraction. `search | eval x = foo-bar` émet `(foo-bar)`,
+c'est-à-dire exactement le SQL de `eval x = foo - bar` ; un nom mal écrit y échoue donc à
+l'**exécution** (colonne inexistante) et non à la compilation. Les autres étapes qui prennent un nom
+de champ (`where`, `stats by`, `table`, `fields`, `sort`, `dedup`, `top`, `rename`, `mvexpand`,
+`eventstats`, `timechart by`, `metric by`) le valident (test
+`eval_is_the_documented_blind_spot_of_the_field_name_guard`).
 
 ### Bornes de compilation (le texte de requête est une entrée NON FIABLE)
 La compilation a lieu **avant** tout budget d'exécution du store : elle porte donc ses propres bornes.
@@ -81,7 +112,7 @@ demande **pas** de redémarrer le service ; en revanche une valeur valide déjà
 redémarrage.
 
 ## Statut
-- ✅ Compilateur de Plume **promu + généralisé** ici (16 étapes, schéma-générique). Suite complète : 139 tests (159 avec `--features forge`).
+- ✅ Compilateur de Plume **promu + généralisé** ici (16 étapes, schéma-générique). Suite complète : 150 tests (170 avec `--features forge`).
 - ✅ Consommé par la console Forge et par Plume via une **git-dep épinglée par tag** :
   `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.0" }` — un clone autonome de
   l'un ou l'autre produit compile sans avoir ce dépôt en voisin.
