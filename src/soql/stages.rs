@@ -169,13 +169,12 @@ pub(crate) fn compile_rex(toks: &[&str], mut sql: String, mut ocols: Vec<String>
 }
 
 pub(crate) fn compile_fields(toks: &[&str], mut sql: String, mut ocols: Vec<String>, jf: Option<&str>, d: &dyn Dialect) -> Result<(String, Vec<String>), String> {
-    let fields: Vec<String> = toks[1..].join(" ").split(',')
-        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    for f in &fields {
-        if !soql_ident_ok(f) {
-            return Err(format!("fields : champ invalide : {f}"));
-        }
-    }
+    // MÊME PORTE que `by`/`dedup` : liste séparée par des virgules seules, aucune entrée jetée.
+    // Mesuré avant : `search | fields` et `search | fields ,` émettaient `SELECT  FROM (…)` — du SQL
+    // syntaxiquement invalide envoyé au store — et `fields ,src_ip` jetait l'entrée vide sans un mot.
+    let fields: Vec<String> = FieldList::commas(&toks[1..].join(" "))
+        .map_err(|bad| format!("fields : champ invalide : {bad}"))?
+        .into_vec();
     let sel: Vec<String> = fields.iter().map(|f| format!("{} AS {}", soql_field(f, &ocols, jf, d), soql_qid(f))).collect();
     sql = format!("SELECT {} FROM ({sql})", sel.join(","));
     ocols = fields;
@@ -184,22 +183,21 @@ pub(crate) fn compile_fields(toks: &[&str], mut sql: String, mut ocols: Vec<Stri
 
 pub(crate) fn compile_table(toks: &[&str], mut sql: String, mut ocols: Vec<String>, jf: Option<&str>, d: &dyn Dialect) -> Result<(String, Vec<String>), String> {
     let raw = toks[1..].join(" ");
-    if raw.trim() != "*" {
-        let fields: Vec<String> = raw
-            .split(|c| c == ',' || c == ' ')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        for f in &fields {
-            if !soql_ident_ok(f) {
-                return Err(format!("table : champ invalide : {f}"));
-            }
-        }
-        if !fields.is_empty() {
-            let sel: Vec<String> = fields.iter().map(|f| format!("{} AS {}", soql_field(f, &ocols, jf, d), soql_qid(f))).collect();
-            sql = format!("SELECT {} FROM ({sql})", sel.join(","));
-            ocols = fields;
-        }
+    // `table *` ET `table` NU sont des PASSE-PLAT DÉLIBÉRÉS (contrat existant, épinglé par
+    // `phaseb_table_star_and_bare_are_not_narrowing` : ils ne restreignent pas la projection, donc
+    // l'élagage de `message` ne s'applique pas). Ils ne passent pas par la porte : il n'y a pas de
+    // liste à valider. Tout le reste y passe.
+    if !raw.trim().is_empty() && raw.trim() != "*" {
+        // MÊME PORTE, AUTRE GRAMMAIRE : ici le BLANC est un séparateur (`table a b` est légitime,
+        // mesuré), donc une suite de séparateurs est indiscernable d'un seul et se réduit. Ce que la
+        // porte ferme quand même : une liste qui ne contient QUE des séparateurs (`table ,`) ne peut
+        // plus s'évaporer en silence — elle est refusée, comme partout ailleurs.
+        let fields: Vec<String> = FieldList::commas_or_blanks(&raw)
+            .map_err(|bad| format!("table : champ invalide : {bad}"))?
+            .into_vec();
+        let sel: Vec<String> = fields.iter().map(|f| format!("{} AS {}", soql_field(f, &ocols, jf, d), soql_qid(f))).collect();
+        sql = format!("SELECT {} FROM ({sql})", sel.join(","));
+        ocols = fields;
     }
     Ok((sql, ocols))
 }
@@ -234,15 +232,11 @@ pub(crate) fn compile_rename(toks: &[&str], mut sql: String, mut ocols: Vec<Stri
 }
 
 pub(crate) fn compile_dedup(toks: &[&str], mut sql: String, ocols: Vec<String>, jf: Option<&str>, d: &dyn Dialect) -> Result<(String, Vec<String>), String> {
-    let fields: Vec<String> = toks[1..].join(" ").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    if fields.is_empty() {
-        return Err("dedup : champ(s) requis".into());
-    }
-    for f in &fields {
-        if !soql_ident_ok(f) {
-            return Err(format!("dedup : champ invalide : {f}"));
-        }
-    }
+    // MÊME PORTE que `by`/`fields` (mesuré avant : `dedup ,src_ip` jetait l'entrée vide en silence ;
+    // la liste vide était déjà refusée ici, elle l'est maintenant par la porte, comme partout).
+    let fields: Vec<String> = FieldList::commas(&toks[1..].join(" "))
+        .map_err(|bad| format!("dedup : champ invalide : {bad}"))?
+        .into_vec();
     let gb: Vec<String> = fields.iter().map(|f| soql_field(f, &ocols, jf, d)).collect();
     sql = format!("SELECT * FROM ({sql}) GROUP BY {}", gb.join(","));
     Ok((sql, ocols))

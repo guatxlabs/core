@@ -334,39 +334,80 @@ pub(crate) fn in_clause_whole(expr: &str) -> Option<(String, bool, Vec<String>)>
 }
 
 // ---------------------------------------------------------------------------------------------
-// LISTE DE LABELS D'UN `by` — UN SEUL ENDROIT DÉCIDE DE SA VALIDITÉ.
+// LISTE DE NOMS DE CHAMPS SÉPARÉE PAR DES VIRGULES — UN SEUL ENDROIT DÉCIDE DE SA VALIDITÉ.
 //
-// Quatre étapes prennent un `by` (`stats`, `timechart`, `eventstats` via `by_fields` ; `metric` via
-// `metric_base`). Tant que chacune découpait la chaîne elle-même, la correction d'un `by` corrigeait
-// UNE étape : le `.filter(|s| !s.is_empty())` retiré de `metric_base` est resté dans `by_fields`, et
-// les trois étapes qui en dépendent ont continué à JETER les labels vides — `stats count by` émettait
-// `SELECT ,COUNT(*) … GROUP BY ` (SQL invalide) et `timechart … by ,` perdait le regroupement demandé
-// sans un mot. Le champ est PRIVÉ : la seule façon d'obtenir une liste de labels est `ByLabels::parse`.
+// LE DÉFAUT QUE CE TYPE FERME, ET SA PORTÉE. `.filter(|s| !s.is_empty())` posé sur une telle liste
+// FAIT DISPARAÎTRE en silence une entrée que l'utilisateur a écrite — et, quand il n'en reste
+// aucune, laisse l'étape émettre du SQL SYNTAXIQUEMENT INVALIDE ou s'évaporer sans un mot. Le
+// correctif précédent l'avait retiré d'UNE étape (`metric ... by`) ; il vivait encore, ligne pour
+// ligne, dans `by_fields` (donc `stats by`, `timechart by`, `eventstats by`) ET dans `compile_fields`
+// et `compile_dedup`. Mesuré : `stats count by` -> `SELECT ,COUNT(*) … GROUP BY ` ; `fields` ->
+// `SELECT  FROM (…)` ; `timechart … by ,` -> le `by` demandé disparaît ; `fields ,src_ip` /
+// `dedup ,src_ip` -> entrée vide jetée sans un mot.
+//
+// LE CHAMP EST PRIVÉ : la seule façon d'obtenir une `FieldList` est de passer par un de ses deux
+// constructeurs. Une étape qui découperait la chaîne elle-même n'obtiendrait pas de `FieldList`, et
+// les émetteurs (`by_fields`, `compile_fields`, `compile_dedup`, `compile_table`, `metric_base`) en
+// prennent une. La règle n'est donc pas « pensez à valider », c'est le type.
+//
+// DEUX CONSTRUCTEURS, PARCE QU'IL Y A DEUX GRAMMAIRES — pas deux politiques :
+//   - `commas` : le séparateur est la VIRGULE SEULE (`by`, `fields`, `dedup` ; `fields a b` est
+//     refusé, mesuré). Une entrée vide y est donc forcément une virgule de trop TAPÉE par
+//     l'utilisateur -> refus.
+//   - `commas_or_blanks` : le jeu de séparateurs contient le BLANC (`table a b` est légitime,
+//     mesuré). Une SUITE de séparateurs y est indiscernable d'un seul (`table a, b`, `table a,b`,
+//     `table a  b`), donc les suites sont réduites — LIMITE ASSUMÉE ET MESURÉE : `table a,,b` rend
+//     bien `a` et `b`. Ce qui reste fermé des deux côtés : une liste VIDE est refusée, jamais un
+//     `table` qui ne projette rien en silence.
 // ---------------------------------------------------------------------------------------------
 
-/// Le label qui a fait refuser un `by`. `Display` rend `(vide)` pour un label vide : un message qui
-/// nomme le vide par une chaîne vide ne dit rien à l'utilisateur.
-pub(crate) struct BadByLabel(String);
+/// L'entrée qui a fait refuser une liste. `Display` rend `(vide)` pour une entrée vide et
+/// `(liste vide)` pour une liste sans aucune entrée : un message qui nomme le vide par une chaîne
+/// vide ne dit rien à l'utilisateur.
+pub(crate) struct BadFieldEntry(Option<String>);
 
-impl std::fmt::Display for BadByLabel {
+impl std::fmt::Display for BadFieldEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_empty() { "(vide)" } else { self.0.as_str() })
+        match &self.0 {
+            None => f.write_str("(liste vide)"),
+            Some(s) if s.is_empty() => f.write_str("(vide)"),
+            Some(s) => f.write_str(s),
+        }
     }
 }
 
-/// Les labels d'un `by`, VALIDÉS. Champ privé : impossible d'en fabriquer une hors de `parse`.
-pub(crate) struct ByLabels(Vec<String>);
+/// Une liste de noms de champs, VALIDÉE. Champ privé (cf. bandeau).
+pub(crate) struct FieldList(Vec<String>);
 
-impl ByLabels {
-    /// `raw` = tout ce qui suit `by`, jetons joints par un espace. AUCUN LABEL N'EST JETÉ : la liste
-    /// est rendue telle quelle à `soql_ident_ok`, qui tranche — et lui seul. `by` NU donne
-    /// `"".split(',')` = UN label vide, refusé comme les autres : aucun cas particulier à écrire, et
-    /// aucun `by` demandé ne peut s'évaporer en silence.
-    pub(crate) fn parse(raw: &str) -> Result<ByLabels, BadByLabel> {
-        let labels: Vec<String> = raw.split(',').map(|s| s.trim().to_string()).collect();
-        match labels.iter().find(|l| !soql_ident_ok(l)) {
-            Some(bad) => Err(BadByLabel(bad.clone())),
-            None => Ok(ByLabels(labels)),
+impl FieldList {
+    /// Liste séparée par des VIRGULES SEULES (`by`, `fields`, `dedup`). AUCUNE ENTRÉE N'EST JETÉE :
+    /// la liste part telle quelle à `soql_ident_ok`, qui tranche — et lui seul. Une étape sans
+    /// argument donne `"".split(',')` = UNE entrée vide, refusée comme les autres : aucun cas
+    /// particulier à écrire, et aucune liste demandée ne peut s'évaporer.
+    pub(crate) fn commas(raw: &str) -> Result<FieldList, BadFieldEntry> {
+        Self::check(raw.split(',').map(|s| s.trim().to_string()).collect())
+    }
+
+    /// Liste dont le jeu de séparateurs contient le BLANC (`table`). Les SUITES de séparateurs sont
+    /// réduites (elles sont indiscernables d'un seul, cf. bandeau) ; une liste VIDE reste refusée.
+    pub(crate) fn commas_or_blanks(raw: &str) -> Result<FieldList, BadFieldEntry> {
+        Self::check(
+            raw.split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect(),
+        )
+    }
+
+    /// LE site de décision, partagé par les deux grammaires : liste vide -> refus ; sinon la première
+    /// entrée qui n'est pas un identifiant -> refus, en la nommant.
+    fn check(entries: Vec<String>) -> Result<FieldList, BadFieldEntry> {
+        if entries.is_empty() {
+            return Err(BadFieldEntry(None));
+        }
+        match entries.iter().find(|e| !soql_ident_ok(e)) {
+            Some(bad) => Err(BadFieldEntry(Some(bad.clone()))),
+            None => Ok(FieldList(entries)),
         }
     }
 
