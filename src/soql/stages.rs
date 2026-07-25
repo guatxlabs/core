@@ -76,7 +76,7 @@ pub(crate) fn compile_where(toks: &[&str], mut sql: String, ocols: Vec<String>, 
     // OP 2 (`in` / `not in`) dans `where` : résout le champ via `soql_field` (colonne réelle /
     // alias de stage / json_extract), CAST REAL si liste numérique sur champ JSON (même règle
     // que le `where` scalaire). Échappe les valeurs textuelles.
-    if let Some((field, negate, vals)) = soql_parse_in(&expr) {
+    if let Some((field, negate, vals)) = in_clause_whole(expr.trim()) {
         if !soql_ident_ok(&field) {
             return Err(format!("where : champ invalide : {field}"));
         }
