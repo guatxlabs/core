@@ -1564,3 +1564,63 @@
         let c = to_sql("search 2026-07-25T10:00:00", 0, 0, &Schema::events()).unwrap();
         assert!(c.contains("LIKE '%2026-07-25T10:00:00%'"), "{c}");
     }
+
+    // --- PRÉ-PASS `in (...)` : nom de champ COMPLET (plus de filtre muet sur un AUTRE champ) ----
+    #[test]
+    fn in_prepass_never_filters_a_field_the_user_did_not_name() {
+        // DÉFAUT PRÉ-EXISTANT (mesuré sur 4b16822, AVANT ce correctif) : la classe `[A-Za-z0-9_]*` de
+        // `soql_in_re` n'accrochait que le DERNIER segment après le tiret/point.
+        //   search x-forwarded-for in (1,2) -> CAST(json_extract(fields,'$.for') AS REAL) IN (1,2)
+        //   search src-ip in (10,11)        -> ... '$.ip'  ... IN (10,11)
+        //   search http.status in (500,502) -> ... '$.status' ... IN (500,502)
+        // Ce n'est PAS un scan plein-texte : c'est un FILTRE MUET SUR UN AUTRE CHAMP -> faux négatif
+        // silencieux dans une règle de détection. ATTENDU : refus explicite nommant le champ COMPLET.
+        for (q, field, ghost) in [
+            ("search x-forwarded-for in (1,2)", "x-forwarded-for", "$.for"),
+            ("search src-ip in (10,11)", "src-ip", "$.ip"),
+            ("search http.status in (500,502)", "http.status", "$.status"),
+            ("search -foo in (1,2)", "-foo", "$.foo"),
+        ] {
+            match to_sql(q, 0, 0, &Schema::events()) {
+                Ok(sql) => panic!("attendu une erreur pour « {q} », obtenu un filtre : {sql}"),
+                Err(e) => {
+                    assert!(e.contains(field), "l'erreur doit nommer le champ COMPLET {field} : {e}");
+                    assert!(!e.contains(ghost), "l'erreur ne doit pas parler du champ fantôme {ghost} : {e}");
+                }
+            }
+        }
+        // Même défaut sur l'étape `where` (le pré-pass y passe par `soql_parse_in`).
+        let e = to_sql("search | where x-forwarded-for in (1,2)", 0, 0, &Schema::events())
+            .expect_err("`where` doit refuser, pas filtrer un autre champ");
+        assert!(e.contains("x-forwarded-for"), "l'erreur doit nommer le champ complet : {e}");
+    }
+
+    #[test]
+    fn in_prepass_legitimate_clauses_are_unchanged() {
+        // CONTRE-PREUVE (anti-régression) : les 5 formes légitimes du corpus rendent le MÊME SQL
+        // qu'avant le correctif — vérifié ici par leur SQL LITTÉRAL (goldens figés).
+        let ev = Schema::events();
+        let base = "SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event";
+        assert_eq!(
+            to_sql("search dport in (80,443)", 0, 0, &ev).unwrap(),
+            format!("{base} WHERE CAST(json_extract(fields,'$.dport') AS REAL) IN (80,443)")
+        );
+        assert_eq!(
+            to_sql("search user not in (root,ubuntu)", 0, 0, &ev).unwrap(),
+            format!("{base} WHERE json_extract(fields,'$.user') NOT IN ('root','ubuntu')")
+        );
+        assert_eq!(
+            to_sql("search source=web dport in (80,443,8080)", 0, 0, &ev).unwrap(),
+            format!("{base} WHERE CAST(json_extract(fields,'$.dport') AS REAL) IN (80,443,8080) AND \"source\" = 'web'")
+        );
+        assert_eq!(
+            to_sql("search | where dport in (80,443)", 0, 0, &ev).unwrap(),
+            format!("SELECT * FROM ({base}) WHERE CAST(json_extract(fields,'$.dport') AS REAL) IN (80,443)")
+        );
+        // Une clause `in (` À L'INTÉRIEUR d'un littéral quoté n'est PAS une clause `in` (CORE-1) :
+        // elle reste une égalité, exactement comme avant.
+        assert_eq!(
+            to_sql("search message=\"user in (a,b)\"", 0, 0, &ev).unwrap(),
+            format!("{base} WHERE \"message\" = 'user in (a,b)'")
+        );
+    }

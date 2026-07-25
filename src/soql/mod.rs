@@ -679,9 +679,34 @@ fn soql_glue_spaced_ops(tokens: Vec<String>) -> Vec<String> {
 /// La liste `(a,b,c)` contient des virgules/espaces que `soql_tokenize` casserait : on l'extrait AVANT
 /// le glue/tokenize via un PRÉ-PASS dédié au niveau STRING (cf. `soql_in_collect`). Bornée : la liste
 /// interne `[^()]*` interdit toute parenthèse imbriquée (motif fini, pas de ReDoS).
+///
+/// Le groupe 1 capture le nom de champ ENTIER — `.` et `-` inclus (`soql_fieldish`), PAS seulement
+/// `[A-Za-z0-9_]`. Avec l'ancienne classe, `\b` s'ouvrait APRÈS le tiret/point et la capture ne
+/// retenait que le DERNIER segment : `x-forwarded-for in (1,2)` filtrait le champ `for`,
+/// `http.status in (500,502)` le champ `status` — un filtre MUET SUR UN AUTRE CHAMP (pas un scan
+/// plein-texte : un faux négatif silencieux dans une règle de détection). La validité du nom capturé
+/// est tranchée par l'appelant (`soql_in_collect` / `soql_parse_in`), qui REFUSE un nom non
+/// identifiant au lieu de filtrer un champ que l'utilisateur n'a pas nommé.
 fn soql_in_re() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"(?i)\b([A-Za-z_][A-Za-z0-9_]*)\s+(not\s+)?in\s*\(([^()]*)\)").unwrap())
+    RE.get_or_init(|| regex::Regex::new(r"(?i)\b([A-Za-z_][A-Za-z0-9_.\-]*)\s+(not\s+)?in\s*\(([^()]*)\)").unwrap())
+}
+
+/// Nom de champ COMPLET d'une clause `in (...)` : la capture du groupe 1, ÉTENDUE vers la gauche tant
+/// que les caractères restent « forme de nom de champ ». `\b` garantit que le caractère précédent n'est
+/// pas `[A-Za-z0-9_]` — il peut en revanche être `-` ou `.` quand le nom DÉBUTE par un caractère que la
+/// classe de tête n'admet pas (`-foo in (1,2)`). Sans cette extension, un tel nom serait tronqué et le
+/// filtre porterait, là encore, sur un AUTRE champ.
+fn soql_in_full_field(first: &str, field_start: usize, captured: &str) -> String {
+    let lead: String = first[..field_start]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{lead}{captured}")
 }
 
 /// CORE-1 : TRUE si l'octet `pos` de `s` tombe À L'INTÉRIEUR d'un littéral entre guillemets (nombre de `"`
@@ -717,6 +742,15 @@ fn soql_in_cond(field: &str, negate: bool, vals: &[String], base: &BaseDef, d: &
     Ok(format!("{fexpr}{collate} {} ({list})", if negate { "NOT IN" } else { "IN" }))
 }
 
+/// Message UNIQUE pour un nom de champ MAL ÉCRIT rencontré là où un FILTRE de champ est attendu
+/// (`x-forwarded-for=1`, `http.status in (500)`). Donne l'ÉCHAPPATOIRE, MESURÉ par les tests : mettre le
+/// terme entre guillemets le rend à la recherche plein-texte.
+fn soql_bad_field_msg(field: &str, term: &str) -> String {
+    format!(
+        "champ invalide dans le filtre : {field} (un nom de champ n'accepte que lettres, chiffres et « _ » ; pour chercher ce texte tel quel, mettez-le entre guillemets : \"{term}\")"
+    )
+}
+
 /// PRÉ-PASS `in`/`not in` (cf. `soql_in_re`) : extrait chaque clause `field [not] in (...)` de la chaîne
 /// de filtres, pousse sa condition SQL dans `conds`, et renvoie la chaîne PRIVÉE de ces spans (le reste
 /// suit le chemin de filtre normal : glue + tokenize + split d'opérateurs).
@@ -736,6 +770,14 @@ fn soql_in_collect(first: &str, base: &BaseDef, conds: &mut Vec<String>, d: &dyn
         if soql_pos_quoted(first, field_start) {
             return caps[0].to_string(); // span verbatim : pas une clause `in`
         }
+        // NOM DE CHAMP COMPLET, sinon REFUS. Le groupe 1 capture désormais `.`/`-` (cf. `soql_in_re`) :
+        // un nom mal écrit (`x-forwarded-for`, `http.status`) est REFUSÉ explicitement au lieu d'être
+        // tronqué en un filtre muet sur son dernier segment (`for`, `status`).
+        let field = soql_in_full_field(first, field_start, &caps[1]);
+        if !soql_ident_ok(&field) {
+            err = Some(soql_bad_field_msg(&field, &caps[0]));
+            return String::from(" ");
+        }
         let negate = caps.get(2).is_some();
         let vals = soql_in_values(&caps[3]);
         if vals.is_empty() {
@@ -745,7 +787,7 @@ fn soql_in_collect(first: &str, base: &BaseDef, conds: &mut Vec<String>, d: &dyn
             conds.push(if negate { "1=1".to_string() } else { "1=0".to_string() });
             return String::from(" ");
         }
-        match soql_in_cond(&caps[1], negate, &vals, base, d) {
+        match soql_in_cond(&field, negate, &vals, base, d) {
             Ok(c) => conds.push(c),
             Err(e) => err = Some(e),
         }
