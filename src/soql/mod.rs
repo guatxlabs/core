@@ -805,10 +805,11 @@ fn soql_in_collect(first: &str, base: &BaseDef, conds: &mut Vec<String>, d: &dyn
 fn table_conds(first: &str, base: &BaseDef, d: &dyn Dialect, ko_depth: u32) -> Result<Vec<String>, String> {
     let mut conds: Vec<String> = Vec::new();
     // OP 2 (`in` / `not in`) : pré-pass dédié AVANT glue/tokenize. La liste `(a,b,c)` porte virgules/
-    // espaces que `soql_tokenize` éclaterait ; on l'extrait au niveau string (gate `(` = perf, évite
-    // la regex quand aucune liste possible). Les conditions IN sont poussées en TÊTE de `conds`.
+    // espaces que `soql_tokenize` éclaterait ; on l'extrait au niveau string. Le gate est de la PERF
+    // (éviter la regex quand aucune liste n'est possible) et il ne NOMME PAS le délimiteur : il le
+    // DEMANDE à `helpers`, seul endroit où la grammaire de la clause est décrite.
     let cleaned;
-    let first = if first.contains('(') {
+    let first = if in_prepass_possible(first) {
         cleaned = soql_in_collect(first, base, &mut conds, d)?;
         cleaned.as_str()
     } else {
