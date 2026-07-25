@@ -1129,6 +1129,18 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
     if depth > 3 {
         return Err("sous-recherches trop imbriquées (max 3)".into());
     }
+    // S2 (c) — BORNE DU TEXTE D'ENTRÉE. Le contrôle de taille du SQL a lieu APRÈS chaque étape : il ne
+    // borne donc pas le pic TRANSITOIRE d'une étape, qui est proportionnel au texte reçu (mesuré :
+    // 400 006 octets de texte -> 4 600 089 octets de SQL en une seule étape). C'est ce texte qu'on borne
+    // ici, AVANT toute analyse. Défaut très au-dessus du réel (Plume plafonne déjà une requête
+    // enregistrée à 16 Kio ; la requête la plus longue du corpus fait 206 octets).
+    let max_text = soql_max_text_bytes()?;
+    if soql.len() as i64 > max_text {
+        return Err(format!(
+            "requête trop longue : {} octets de texte (maximum {max_text})",
+            soql.len()
+        ));
+    }
     // FIELD FILTERS : au depth 0, installe le jeu de masques du schéma dans le thread-local pour toute
     // la durée de la compilation (sous-recherches incluses : même thread, déjà couvert). VIDE -> no-op ->
     // parité stricte. RAII : restauré au Drop même en erreur/`?`. Les depths > 0 héritent du scope du parent.
@@ -1156,6 +1168,11 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
     } else {
         soql.to_string()
     };
+    // Même borne APRÈS détente des macros : une macro détend du texte, et c'est ce texte-là qui est
+    // analysé. (`MACRO_MAX_LEN` borne une macro isolée, pas le résultat cumulé.)
+    if expanded.len() as i64 > max_text {
+        return Err(format!("requête trop longue après détente des macros : {} octets de texte (maximum {max_text})", expanded.len()));
+    }
     let stages = soql_split_pipes(&expanded);
     if stages.is_empty() {
         return Err("soql vide".into());
@@ -1168,11 +1185,23 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
     if stages.len() as i64 > max_stages {
         return Err(format!("pipeline trop long : {} étapes (maximum {max_stages})", stages.len()));
     }
-    // S2 (b) — BORNE DE TAILLE DU SQL ÉMIS, vérifiée APRÈS CHAQUE étape (plus bas). `eventstats
-    // values`/`list` interpole le SQL courant DEUX FOIS par étage -> croissance en 4^k : ~700 caractères de
-    // requête suffisaient à produire des centaines de Mo de SQL (OOM PENDANT LA COMPILATION, donc avant tout
-    // budget d'exécution du store). La borne coupe la croissance avec une erreur claire.
+    // S2 (b) — BORNE DE TAILLE DU SQL ÉMIS, vérifiée APRÈS CHAQUE étape ÉMETTRICE : la base, chaque champ
+    // calculé, chaque lookup automatique, puis chaque étape de pipe. `eventstats values`/`list` interpole le
+    // SQL courant DEUX FOIS par étage -> croissance en 4^k : ~700 caractères de requête suffisaient à
+    // produire des centaines de Mo de SQL (OOM PENDANT LA COMPILATION, donc avant tout budget d'exécution du
+    // store). La borne coupe la croissance avec une erreur claire.
+    // La vérification vivait DANS `for stage in &stages[1..]` : une requête à UNE SEULE étape — la forme la
+    // plus courante — n'était donc JAMAIS vérifiée (mesuré : 400 006 octets de texte -> 4 600 089 octets de
+    // SQL, aucune erreur), pas plus que les boucles calcs/auto-lookups situées au-dessus.
     let max_sql = soql_max_sql_bytes()?;
+    let check_sql = |sql: &str| -> Result<(), String> {
+        if sql.len() as i64 > max_sql {
+            return Err(format!(
+                "requête trop complexe : le SQL généré dépasse {max_sql} octets — réduisez le nombre de termes ou d'étapes (en particulier `eventstats values`/`list`, qui imbrique la requête)"
+            ));
+        }
+        Ok(())
+    };
     let f0 = stages[0].trim();
 
     // FILTRE ENVIRONNEMENT : propagé aux bases qui portent `env_id` (cf. table_base). None en
@@ -1219,6 +1248,7 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
             (s, c, schema.default.json_field.clone(), true)
         };
     let jf = json_field.as_deref();
+    check_sql(&sql)?; // S2 (b) : la BASE elle-même est vérifiée (une requête à une seule étape aussi)
 
     // KNOWLEDGE OBJECTS — CHAMPS CALCULÉS : injectés comme des étapes `eval` IMPLICITES juste au-dessus
     // de la base (donc AVANT toute étape utilisateur -> disponibles partout en aval, et dans la projection
@@ -1232,6 +1262,7 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
             let (ns, no) = compile_eval(&format!("eval {name} = {expr}"), sql, ocols, jf, d)?;
             sql = ns;
             ocols = no;
+            check_sql(&sql)?; // S2 (b) : cette boucle échappait au contrôle de taille
         }
         // AUTOMATIC LOOKUPS — injectés JUSTE au-dessus de la base (après les calc, comme un `| lookup`
         // implicite) : réutilise `compile_lookup` -> la clé passe par `soql_field` -> HÉRITE du masque de champ (une
@@ -1249,6 +1280,7 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
             let (ns, no) = compile_lookup(&toks, sql, ocols, jf, d)?;
             sql = ns;
             ocols = no;
+            check_sql(&sql)?; // S2 (b) : cette boucle échappait au contrôle de taille
         }
     }
 
@@ -1277,14 +1309,10 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
         };
         sql = ns;
         ocols = no;
-        // S2 (b) — la taille du SQL accumulé est vérifiée ICI, à chaque étage : une étape qui imbrique la
-        // requête plusieurs fois (`eventstats values/list`) est arrêtée dès le franchissement de la borne,
+        // S2 (b) — la taille du SQL accumulé est vérifiée ICI aussi, à chaque étage : une étape qui imbrique
+        // la requête plusieurs fois (`eventstats values/list`) est arrêtée dès le franchissement de la borne,
         // avant que l'étage suivant ne la multiplie encore.
-        if sql.len() as i64 > max_sql {
-            return Err(format!(
-                "requête trop complexe : le SQL généré dépasse {max_sql} octets — réduisez le nombre d'étapes (en particulier `eventstats values`/`list`, qui imbrique la requête)"
-            ));
-        }
+        check_sql(&sql)?;
     }
     // FIELD FILTERS : caviarde le SAC JSON s'il apparaît dans les colonnes FINALES (search nu / head /
     // sort / where qui ne re-projettent pas) -> aucune clé masquée ne fuit via le blob brut. VIDE -> no-op
