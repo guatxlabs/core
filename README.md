@@ -36,10 +36,19 @@ let c = compile("search severity=HIGH | stats count by mitre | sort -count", &Sc
 // délégué au `Dialect` de la cible (SQLite/DuckDB/ClickHouse), c'est le point d'étranglement unique.
 ```
 ```sh
-cargo test                   # 121 tests (115 unitaires + 5 parité différentielle + 1 doctest)
-cargo test --features forge  # 141 tests (schéma + tests Forge activés)
-cargo test --all-features    # 150 tests (+ modules `ai` et `cold_tier`)
+cargo test                   # 139 tests (133 unitaires + 5 parité différentielle + 1 doctest)
+cargo test --features forge  # 159 tests (schéma + tests Forge activés)
+cargo test --all-features    # 168 tests (+ modules `ai` et `cold_tier`)
 ```
+
+### Nom de champ et recherche plein-texte
+Un nom de champ n'accepte que **lettres, chiffres et `_`**. Un jeton non quoté dont la partie gauche a
+la *forme* d'un nom de champ mais n'en est pas un valide (`x-forwarded-for=1.2.3.4`, `http.status>=500`,
+`src-ip in (10,11)`, y compris sous la forme espacée `foo-bar = 1`) est **refusé** : le laisser filer
+donnerait un scan plein-texte non borné — ou, pour `in (...)`, un filtre sur un *autre* champ — c'est-à-dire
+un jeu de lignes différent de celui demandé, sans un mot. Pour chercher un tel texte, **mettez-le entre
+guillemets** : `search "x-forwarded-for=1.2.3.4"` reste une recherche plein-texte, à l'identique. Une
+phrase quotée n'est jamais lue comme un nom de champ.
 
 ### Bornes de compilation (le texte de requête est une entrée NON FIABLE)
 La compilation a lieu **avant** tout budget d'exécution du store : elle porte donc ses propres bornes.
@@ -72,7 +81,7 @@ demande **pas** de redémarrer le service ; en revanche une valeur valide déjà
 redémarrage.
 
 ## Statut
-- ✅ Compilateur de Plume **promu + généralisé** ici (16 étapes, schéma-générique). Suite complète : 121 tests (141 avec `--features forge`).
+- ✅ Compilateur de Plume **promu + généralisé** ici (16 étapes, schéma-générique). Suite complète : 139 tests (159 avec `--features forge`).
 - ✅ Consommé par la console Forge et par Plume via une **git-dep épinglée par tag** :
   `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.0" }` — un clone autonome de
   l'un ou l'autre produit compile sans avoir ce dépôt en voisin.
