@@ -1534,3 +1534,33 @@
         assert!(ok.contains("json_extract(labels,'$.code')"), "{ok}");
     }
 
+    // --- S11 : un nom de champ invalide ne dégénère plus en scan plein-texte -------------------
+    #[test]
+    fn s11_invalid_field_name_in_filter_is_error() {
+        // Mesuré : `search foo-bar=1` -> `message LIKE '%foo-bar=1%'` (scan non borné + jeu de lignes
+        // DIFFÉRENT de celui demandé = faux négatif muet dans une règle).
+        for (q, field) in [
+            ("search foo-bar=1", "foo-bar"),
+            ("search x-forwarded-for=1.2.3.4", "x-forwarded-for"),
+            ("search http.status>=500", "http.status"),
+        ] {
+            match to_sql(q, 0, 0, &Schema::events()) {
+                Ok(sql) => panic!("attendu une erreur pour « {q} », obtenu du SQL : {sql}"),
+                Err(e) => assert!(e.contains(field), "l'erreur doit nommer le champ {field} : {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn s11_true_freetext_still_scans() {
+        // Un VRAI terme libre (aucun opérateur de comparaison) garde le chemin LIKE, inchangé.
+        let a = to_sql("search failed password", 0, 0, &Schema::events()).unwrap();
+        assert!(a.contains("message LIKE '%failed%'") && a.contains("message LIKE '%password%'"), "{a}");
+        // Une PHRASE quotée qui contient un `=` reste un terme libre (elle ne prétend pas nommer un
+        // champ : sa partie gauche n'a pas la forme d'un identifiant).
+        let b = to_sql("search \"GET /x?a=1\"", 0, 0, &Schema::events()).unwrap();
+        assert!(b.contains("LIKE '%GET /x?a=1%'"), "{b}");
+        // Un horodatage (`:` = alias de `=`) n'est pas un nom de champ : reste un terme libre.
+        let c = to_sql("search 2026-07-25T10:00:00", 0, 0, &Schema::events()).unwrap();
+        assert!(c.contains("LIKE '%2026-07-25T10:00:00%'"), "{c}");
+    }

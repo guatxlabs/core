@@ -806,6 +806,18 @@ fn table_conds(first: &str, base: &BaseDef, d: &dyn Dialect, ko_depth: u32) -> R
             if let Some(pos) = tk.find(op) {
                 let field = &tk[..pos];
                 let val = &tk[pos + op.len()..];
+                // S11 — FAIL-CLOSED. Un jeton qui PRÉTEND nommer un champ (partie gauche en FORME
+                // d'identifiant : `x-forwarded-for`, `http.status`) mais dont le nom n'est pas un
+                // identifiant valide tombait dans la branche terme-libre : `message LIKE '%foo-bar=1%'`
+                // -> scan plein-texte NON BORNÉ à la place d'un filtre indexé, et surtout un JEU DE LIGNES
+                // DIFFÉRENT de celui demandé (faux négatif MUET dans une règle de détection). On refuse
+                // explicitement. Un VRAI terme libre (phrase quotée, horodatage, chemin/URL — partie gauche
+                // qui n'a pas la forme d'un nom de champ) garde le chemin LIKE, inchangé.
+                if !soql_ident_ok(field) && soql_fieldish(field) {
+                    return Err(format!(
+                        "champ invalide dans le filtre : {field} (un nom de champ n'accepte que lettres, chiffres et « _ »)"
+                    ));
+                }
                 if soql_ident_ok(field) {
                     let fstr = soql_filter_field(field, false, base, d)?; // FIELD FILTERS : rejet si champ masqué (oracle)
                     if op == "=~" {
