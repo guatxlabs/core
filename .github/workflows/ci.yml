@@ -1,0 +1,164 @@
+# guatx-core — CI (build/test + supply-chain & secret hygiene).
+# =============================================================================
+#
+# Jobs :
+#   - test     : `cargo test` (défaut, feature OFF) + `--features forge` + `--all-features` + clippy ;
+#   - security : `cargo audit` (RustSec) + `gitleaks` (secrets), en PARALLÈLE, gate indépendant.
+#
+# guatx-core est un crate Rust STANDALONE : `Cargo.toml` à la racine du repo, AUCUNE dépendance
+# de chemin (path-dep), aucun Python, aucun Postgres, aucun checkout frère. La CI checkout ce
+# seul repo et compile à la racine.
+#
+# Toutes les versions (actions, toolchain Rust) sont PINNÉES par SHA pour la reproductibilité
+# (Dependabot les maintient à jour derrière une PR).
+
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# Annule les runs obsolètes sur une même ref (économie de runners).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Test — le cœur SOQL + SPI, offline. Trois passes : DÉFAUT (feature OFF, ~70 % commun Plume/Forge),
+  # `--features forge` (schéma Forge `Schema::forge()` + ses tests), puis `--all-features` — cette
+  # dernière est le SEUL gate des features `ai` (choke-point de rédaction) et `cold_tier` : sans elle
+  # leur code n'est jamais compilé ni testé par la CI. Le mécanisme générique de row-scoping
+  # (`RowFilter`) reste couvert dans les trois. Clippy est INDICATIF (voir plus bas).
+  # ---------------------------------------------------------------------------
+  test:
+    name: test (cargo test [+forge] [+all-features] + clippy)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Rust toolchain (pinné)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # @stable (no semver tags; pinned to stable branch commit)
+        with:
+          toolchain: "1.96.0"
+          components: clippy
+
+      - name: Cache cargo (registry + target)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      # Passe 1 — build community DÉFAUT (feature OFF). ~70 % commun, compilateur SOQL unique.
+      - name: cargo test (défaut, feature OFF)
+        run: cargo test --locked --verbose
+
+      # Passe 2 — feature `forge` (schéma rouge + tests). Doit rester vert en même temps que le défaut.
+      - name: cargo test (--features forge)
+        run: cargo test --locked --features forge --verbose
+
+      # Passe 3 — TOUTES les features (`forge` + `ai` + `cold_tier`). Sans cette passe, le module `ai`
+      # (rédaction/zéro-autorité-d'exécution) et la variante `cold_tier` ne sont couverts par AUCUN job.
+      - name: cargo test (--all-features)
+        run: cargo test --locked --all-features --verbose
+
+      # Clippy = INDICATIF (non bloquant) : le lint n'est PAS un gate ici (pas de `-D warnings`), il
+      # sert à voir les régressions de style. Ne PAS ajouter de nouveau warning.
+      - name: clippy (all targets, all features — indicatif)
+        run: cargo clippy --all-targets --all-features
+
+  # ---------------------------------------------------------------------------
+  # Security — supply-chain + secret hygiene. Gate INDÉPENDANT : tourne en parallèle du job `test`
+  # et ne conditionne jamais sa logique. Deux checks :
+  #   1) cargo-audit  — scan RustSec de l'arbre de deps verrouillé (Cargo.lock). `--deny warnings`
+  #      => une advisory unmaintained/yanked/vuln FAIL le job.
+  #   2) gitleaks     — scan de secrets (arbre + historique). Config éphémère (écrite ci-dessous, NON
+  #      committée) qui ÉTEND le ruleset par défaut (`useDefault = true`). guatx-core n'embarque AUCUN
+  #      fixture-secret placeholder (le corpus de test = requêtes SOQL, zéro credential) -> aucune
+  #      allowlist nécessaire ; le scan flag donc les VRAIES fuites sans faux positif à masquer.
+  # ---------------------------------------------------------------------------
+  security:
+    name: security (cargo-audit + gitleaks)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0   # full history so gitleaks can scan past commits, not just the tip.
+
+      - name: Setup Rust toolchain (pinné)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # @stable (no semver tags; pinned to stable branch commit)
+        with:
+          toolchain: "1.96.0"
+
+      - name: Install cargo-audit (version épinglée)
+        run: cargo install cargo-audit --locked --version 0.21.2
+
+      - name: cargo audit (deny warnings)
+        run: cargo audit --deny warnings
+
+      # Ephemeral gitleaks config (runner-only, never committed) — extends the default ruleset.
+      # guatx-core ships no placeholder-secret fixture (tests/corpus_soql_coverage.txt is SOQL query
+      # text, zero credentials), so NO path allowlist is needed. If a future documented placeholder
+      # fixture ever trips the scan, allowlist that exact path here with a comment explaining why —
+      # never blanket-suppress.
+      - name: Write gitleaks config (extend defaults)
+        run: |
+          cat > "$GITHUB_WORKSPACE/.gitleaks-ci.toml" <<'EOF'
+          title = "guatx-core CI gitleaks config"
+          [extend]
+          useDefault = true
+          EOF
+
+      # Pinned gitleaks BINARY (v8.24.3) — no repo token, no license required, and behaves
+      # identically on push and pull_request. Replaces the former gitleaks GitHub Action, which now
+      # requires a repo token on pull_request events (→ failed every PR). The download is
+      # checksum-pinned (sha256 from the release's checksums.txt) so a tampered/substituted asset
+      # fails the build. Scans the tree + full history (fetch-depth: 0 above) against the ephemeral
+      # .gitleaks-ci.toml written just above. This job keeps only `permissions: contents: read` —
+      # the binary needs no token (least privilege).
+      - name: Secret scan (gitleaks, pinned binary — no token/license required)
+        run: |
+          set -euo pipefail
+          GL_VER=8.24.3
+          GL_SHA=9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+          curl -sSfL -o /tmp/gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VER}/gitleaks_${GL_VER}_linux_x64.tar.gz"
+          echo "${GL_SHA}  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          /tmp/gitleaks detect --source . --config "$GITHUB_WORKSPACE/.gitleaks-ci.toml" --no-banner --redact --exit-code 1
+
+  # ---------------------------------------------------------------------------
+  # CI — POINT D'ENTRÉE UNIQUE du ruleset de `main`. Le nom `CI` est STABLE : il agrège
+  # `test` + `security` sans dépendre d'aucune matrice, donc faire évoluer les jobs (versions,
+  # étapes) ne casse JAMAIS la règle « contrôle requis ». Sans ce job, il faudrait exiger les
+  # noms générés par chaque job : le jour où l'un change, le check exigé ne remonte plus JAMAIS
+  # et `main` devient impoussable, y compris pour le correctif qui réparerait ça.
+  # ---------------------------------------------------------------------------
+  ci-ok:
+    name: CI
+    if: always() # sinon un job en échec SAUTE celui-ci au lieu de le faire échouer
+    needs: [test, security]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Tous les jobs doivent avoir RÉUSSI
+        # `skipped` et `cancelled` sont traités comme des échecs À DESSEIN :
+        # GitHub considère un check requis mais sauté comme satisfait, ce qui
+        # laisserait passer un job jamais exécuté.
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: |
+          echo "::error::un job de CI n'a pas réussi : ${{ join(needs.*.result, ', ') }}"
+          exit 1

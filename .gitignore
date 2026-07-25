@@ -1,0 +1,32 @@
+/target
+# hygiène défensive (repo Rust pur aujourd'hui, mais évite tout cruft futur)
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+node_modules/
+*.bak
+*.old
+*.orig
+*.tmp
+*.swp
+.DS_Store
+
+# secrets & matériel cryptographique — jamais committés (filet de sécurité, aucun de ces
+# motifs ne correspond à un fichier suivi aujourd'hui)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.age
+*.token
+*.jks
+id_rsa*
+id_ed25519*
+kubeconfig
+*.kubeconfig
+secrets.yaml
+secrets.yml
