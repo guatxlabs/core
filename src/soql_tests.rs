@@ -2551,6 +2551,13 @@ AND lk.\"key\"=\"src_ip\"";
         // DANS LA SOURCE : tout découpage sur la virgule est soit la porte, soit une exception
         // ÉCRITE ICI AVEC SA RAISON. Un 6e site apparaît -> ce test échoue, et le contributeur lit
         // quoi faire. Aucune étape n'est nommée : c'est la FORME du défaut qui est interdite.
+        //
+        // PORTÉE EXACTE, MESURÉE, NON UNIVERSELLE : le détecteur lit LIGNE À LIGNE, donc un découpage
+        // écrit sur plusieurs lignes (`.split(\n    ',',\n)`) lui échappe. Mesuré sur une 21e étape
+        // ajoutée exprès : ce test-ci ne bronche pas, et `no_typed_field_list_can_evaporate_whatever_
+        // _the_step` la refuse quand même (152 passed / 2 failed). Les deux gardes ne se recouvrent
+        // pas par hasard : celle-ci interdit la FORME du défaut, l'autre en constate l'EFFET — c'est
+        // l'effet qui compte, et il reste couvert quelle que soit l'écriture.
         const DECLARED: [(&str, &str, &str); 5] = [
             ("helpers.rs", "commas", "LA PORTE — virgule seule (`by`, `fields`, `dedup`)"),
             ("helpers.rs", "commas_or_blanks", "LA PORTE — virgule ou blanc (`table`, `lookup … OUTPUT`)"),
