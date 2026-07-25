@@ -1534,6 +1534,35 @@
         assert!(ok.contains("json_extract(labels,'$.code')"), "{ok}");
     }
 
+    #[test]
+    fn s10_metric_by_without_a_valid_label_is_error_too() {
+        // RÉSIDU DE LA MÊME CLASSE, mesuré sur 742efe7 ET sur 48035b9 : un `by` SANS aucun label valide
+        // s'évaporait en silence (le `.filter(|s| !s.is_empty())` jetait les labels vides) et la requête
+        // rendait TOUTES les séries SANS regroupement — exactement le mode d'échec S10 que le reste de
+        // l'étape refuse. Plus aucun label n'est jeté : `soql_ident_ok` tranche, et lui seul.
+        for q in [
+            "metric node_load1 by",
+            "metric node_load1 by ,",
+            "metric node_load1 by ,,",
+            "metric node_load1 by ,code",
+            "metric node_load1 by code,",
+            "metric node_load1 by code,,job",
+        ] {
+            match to_sql(q, 0, 0, &Schema::events()) {
+                Ok(sql) => panic!("« {q} » doit être refusé et non regrouper en silence : {sql}"),
+                Err(e) => assert!(e.contains("label invalide dans `by`"), "{e}"),
+            }
+        }
+        // Contre-preuve : les formes légitimes de `by` sont intactes (goldens de regroupement).
+        let a = to_sql("metric node_load1 by code", 0, 0, &Schema::events()).unwrap();
+        assert!(a.contains("json_extract(labels,'$.code') AS \"code\""), "{a}");
+        let b = to_sql("metric node_load1 by code,job", 0, 0, &Schema::events()).unwrap();
+        assert!(b.contains("'$.code') AS \"code\""), "{b}");
+        assert!(b.contains("'$.job') AS \"job\""), "{b}");
+        let c = to_sql("metric node_load1 value>3 by code", 0, 0, &Schema::events()).unwrap();
+        assert!(c.contains("value > 3") && c.contains("'$.code')"), "{c}");
+    }
+
     // --- S11 : un nom de champ invalide ne dégénère plus en scan plein-texte -------------------
     #[test]
     fn s11_invalid_field_name_in_filter_is_error() {
@@ -1596,6 +1625,73 @@
         let e = to_sql("search | where x-forwarded-for in (1,2)", 0, 0, &Schema::events())
             .expect_err("`where` doit refuser, pas filtrer un autre champ");
         assert!(e.contains("x-forwarded-for"), "l'erreur doit nommer le champ complet : {e}");
+    }
+
+    // Le nom d'une clause `in (...)` n'est plus défini par une CLASSE DE CARACTÈRES mais par la
+    // FRONTIÈRE de jeton : aucun séparateur, présent ou futur, ne peut donc rouvrir la troncature.
+    // CE TEST EST ÉCRIT CONTRE LA CLASSE, PAS CONTRE LES CAS TRAITÉS : la liste ci-dessous contient
+    // des séparateurs que le code ne nomme NULLE PART (le code ne nomme que l'espace et `(`), y compris
+    // non-ASCII, ainsi que des écritures multi-lignes et des casses mélangées.
+    #[test]
+    fn in_prepass_field_name_is_bounded_by_the_token_not_by_a_character_class() {
+        // MESURÉ sur 742efe7 : la classe `[A-Za-z0-9_.-]` ne retenait que le DERNIER segment ->
+        //   search cache/status in (200,302) -> ... '$.status' ... IN (200,302)   (champ jamais nommé)
+        //   search user@host    in (1,2)     -> "host" IN (1,2)                    (VRAIE colonne indexée)
+        for (q, field, ghost) in [
+            ("search cache/status in (200,302)", "cache/status", "$.status"),
+            ("search user@host in (1,2)", "user@host", "\"host\""),
+            ("search api/v1/status in (500,502)", "api/v1/status", "$.status"),
+            ("search foo$bar in (1,2)", "foo$bar", "$.bar"),
+            ("search foo+bar in (1,2)", "foo+bar", "$.bar"),
+            ("search foo%bar in (1,2)", "foo%bar", "$.bar"),
+            ("search foo!bar in (1,2)", "foo!bar", "$.bar"),
+            ("search foo*bar in (1,2)", "foo*bar", "$.bar"),
+            ("search foo#bar in (1,2)", "foo#bar", "$.bar"),
+            ("search foo@bar in (1,2)", "foo@bar", "$.bar"),
+            // Séparateurs que le correctif n'énumère NULLE PART :
+            ("search foo~bar in (1,2)", "foo~bar", "$.bar"),
+            ("search foo^bar in (1,2)", "foo^bar", "$.bar"),
+            ("search foo&bar in (1,2)", "foo&bar", "$.bar"),
+            ("search foo;bar in (1,2)", "foo;bar", "$.bar"),
+            ("search foo'bar in (1,2)", "foo'bar", "$.bar"),
+            ("search foo,bar in (1,2)", "foo,bar", "$.bar"),
+            ("search foo]bar in (1,2)", "foo]bar", "$.bar"),
+            ("search foo?bar in (1,2)", "foo?bar", "$.bar"),
+            ("search foo=bar in (1,2)", "foo=bar", "$.bar"),
+            ("search foo:bar in (1,2)", "foo:bar", "$.bar"),
+            // Non-ASCII (le nom capturé doit rester une frontière de CARACTÈRE valide) :
+            ("search fooébar in (1,2)", "fooébar", "$.bar"),
+            ("search foo·bar in (1,2)", "foo·bar", "$.bar"),
+            ("search foo→bar in (1,2)", "foo→bar", "$.bar"),
+            ("search fooλbar in (1,2)", "fooλbar", "$.bar"),
+            // Quotation FERMÉE avant le nom : le nom réclamé est tout le jeton, pas son suffixe.
+            ("search \"abc\"status in (1,2)", "abcstatus", "\"status\""),
+            // Casse, espacement multiple, `not in`, écriture multi-ligne :
+            ("search x-forwarded-for IN (1,2)", "x-forwarded-for", "$.for"),
+            ("search x-forwarded-for In (1,2)", "x-forwarded-for", "$.for"),
+            ("search x-forwarded-for    in    (1,2)", "x-forwarded-for", "$.for"),
+            ("search x-forwarded-for not in (1,2)", "x-forwarded-for", "$.for"),
+            ("search x-forwarded-for NOT IN (1,2)", "x-forwarded-for", "$.for"),
+            ("search cache/status\nin (1,2)", "cache/status", "$.status"),
+        ] {
+            match to_sql(q, 0, 0, &Schema::events()) {
+                Ok(sql) => panic!("attendu une erreur pour « {q} », obtenu un filtre : {sql}"),
+                Err(e) => {
+                    assert!(e.contains(field), "l'erreur doit nommer le champ COMPLET {field} : {e}");
+                    assert!(!e.contains(ghost), "l'erreur ne doit pas parler du champ fantôme {ghost} : {e}");
+                }
+            }
+        }
+        // Sous-recherche (depth > 0) et étape `where` : mêmes frontières, même refus.
+        for q in [
+            "search source=a | append [search cache/status in (200,302) | stats count]",
+            "search | stats count by mitre | join mitre [search user@host in (1,2) | stats count]",
+            "search | where cache/status in (1,2)",
+            "search | where foo@bar in (1,2)",
+        ] {
+            let e = to_sql(q, 0, 0, &Schema::events()).expect_err("la garde doit valoir ici aussi");
+            assert!(!e.is_empty(), "{q}");
+        }
     }
 
     #[test]
@@ -1682,6 +1778,164 @@
             to_sql("search \"x-forwarded-for in (1,2)\"", 0, 0, &ev).unwrap(),
             format!("{b} WHERE message LIKE '%x-forwarded-for in (1,2)%'")
         );
+    }
+
+    // --- S11 : GUILLEMETER LA VALEUR N'EXEMPTE RIEN (le marqueur porte sur la PARTIE GAUCHE) -----
+    #[test]
+    fn s11_quoting_the_value_does_not_exempt_the_field_name() {
+        // MESURÉ sur 742efe7 : le marqueur de quotation valait pour le JETON ENTIER, donc guillemeter
+        // la seule VALEUR exemptait la partie gauche et rouvrait le défaut au prix de deux caractères —
+        // `search x-forwarded-for="10.0.0.1"` -> `message LIKE '%x-forwarded-for=10.0.0.1%'`, alors que
+        // `search x-forwarded-for = "10.0.0.1"` (un espace de plus, MÊME sens) était refusé.
+        // La garde se demande maintenant si la PARTIE GAUCHE vient des guillemets, pas le jeton.
+        // Les formes ci-dessous couvrent les 8 opérateurs ET des écritures que le code ne nomme
+        // nulle part : guillemet ORPHELIN, guillemets au MILIEU de la valeur ou du nom, tabulation,
+        // saut de ligne, apostrophes, valeur vide.
+        for (q, field) in [
+            ("search x-forwarded-for=\"10.0.0.1\"", "x-forwarded-for"),
+            ("search x-forwarded-for = \"10.0.0.1\"", "x-forwarded-for"),
+            ("search http.status>=\"500\"", "http.status"),
+            ("search src-ip>=\"5\"", "src-ip"),
+            ("search src-ip<=\"5\"", "src-ip"),
+            ("search src-ip>\"5\"", "src-ip"),
+            ("search src-ip<\"5\"", "src-ip"),
+            ("search foo-bar:\"1\"", "foo-bar"),
+            ("search foo-bar!=\"1\"", "foo-bar"),
+            ("search foo-bar=~\"1\"", "foo-bar"),
+            ("search foo-bar=a\"b\"", "foo-bar"),   // guillemets au MILIEU de la valeur
+            ("search foo-bar=1\"", "foo-bar"),      // guillemet ORPHELIN (jamais fermé)
+            ("search \"foo-bar=1", "foo-bar"),      // guillemet OUVRANT jamais fermé
+            ("search foo-bar\" = 1", "foo-bar"),    // le guillemet non fermé avale l'espace
+            ("search foo\"-\"bar = 1", "foo-bar"),  // guillemets au MILIEU du NOM
+            ("search x\"-forwarded-for\"=10.0.0.1", "x-forwarded-for"),
+            ("search x-forwarded-for='10.0.0.1'", "x-forwarded-for"), // apostrophes : pas des guillemets
+            ("search x-forwarded-for=\"\"", "x-forwarded-for"),       // valeur quotée VIDE
+            ("search foo-bar\t=\t1", "foo-bar"),                      // tabulations
+            ("search foo-bar\n=\n\"1\"", "foo-bar"),                   // écriture MULTI-LIGNE
+            ("search source=web x-forwarded-for=\"1\"", "x-forwarded-for"), // en 2e position
+            ("search x-forwarded-for=\"1\" source=web", "x-forwarded-for"), // en 1re position
+        ] {
+            match to_sql(q, 0, 0, &Schema::events()) {
+                Ok(sql) => panic!("attendu une erreur pour « {q} », obtenu du SQL : {sql}"),
+                Err(e) => assert!(e.contains(field), "l'erreur doit nommer le champ {field} : {e}"),
+            }
+        }
+        // ET LA MÊME CHOSE EN SOUS-RECHERCHE (depth > 0) : la revue a mesuré le contournement dans un
+        // `append [...]` et un `join f [...]`.
+        for q in [
+            "search source=a | append [search x-forwarded-for=\"1\" | stats count]",
+            "search | stats count by m | join m [search x-forwarded-for=\"1\" | stats count by m]",
+            "search a | append [search b | append [search http.status>=\"500\" | stats count]]",
+        ] {
+            let e = to_sql(q, 0, 0, &Schema::events()).expect_err("garde attendue ici aussi");
+            assert!(e.contains("champ invalide dans le filtre"), "{e}");
+        }
+        // TÉMOIN : un filtre NORMAL dont la valeur est quotée reste un filtre indexé (c'est bien la
+        // partie gauche, et elle seule, qui décide).
+        let b = "SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event";
+        assert_eq!(
+            to_sql("search source=\"web\"", 0, 0, &Schema::events()).unwrap(),
+            format!("{b} WHERE \"source\" = 'web'")
+        );
+    }
+
+    // --- S11 : l'échappatoire du message rend le texte RÉELLEMENT SAISI -------------------------
+    #[test]
+    fn s11_error_suggestion_is_the_users_own_text() {
+        // MESURÉ sur 742efe7 : la suggestion était reconstruite à partir du jeton, donc elle PERDAIT le
+        // texte de l'utilisateur — `search -foo in (1,2)` suggérait `"foo in (1,2)"` (tiret de tête
+        // perdu) et `search foo-bar = 1` suggérait `"foo-bar=1"` (espaces perdus). Or les deux
+        // suggestions rendent un JEU DE LIGNES DIFFÉRENT de celui du texte tapé.
+        // La suggestion est désormais une TRANCHE du texte d'entrée (bornes octets du jeton / portée du
+        // match `in`), guillemets retirés — donc le texte de l'utilisateur par construction.
+        let ev = Schema::events();
+        let b = "SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event";
+        for (q, want_term) in [
+            ("search -foo in (1,2)", "-foo in (1,2)"),
+            ("search foo-bar = 1", "foo-bar = 1"),
+            ("search x-forwarded-for = \"10.0.0.1\"", "x-forwarded-for = 10.0.0.1"),
+            ("search cache/status in (200,302)", "cache/status in (200,302)"),
+            ("search foo-bar=a\"b\"", "foo-bar=ab"),
+            ("search src-ip   >=   5", "src-ip   >=   5"),
+        ] {
+            let e = to_sql(q, 0, 0, &ev).expect_err("forme refusée attendue");
+            let sug = format!("mettez-le entre guillemets : \"{want_term}\"");
+            assert!(e.contains(&sug), "la suggestion doit rendre le texte saisi ({sug}) : {e}");
+            // ET ELLE MARCHE : rejouer la suggestion rend une recherche plein-texte SUR CE TEXTE-LÀ.
+            assert_eq!(
+                to_sql(&format!("search \"{want_term}\""), 0, 0, &ev).unwrap(),
+                format!("{b} WHERE message LIKE '%{want_term}%'"),
+                "l'échappatoire suggérée doit compiler en plein-texte sur le texte suggéré"
+            );
+        }
+    }
+
+    // --- LIMITE DOCUMENTÉE : `eval` n'a pas (et ne peut pas avoir) la garde de nom de champ ------
+    #[test]
+    fn eval_is_the_documented_blind_spot_of_the_field_name_guard() {
+        let ev = Schema::events();
+        // MESURÉ : `eval x = foo-bar` compile, et rend EXACTEMENT le SQL de la soustraction explicite
+        // `foo - bar`. Ce test PINGLE la limite au lieu de la laisser se découvrir en revue : tant que
+        // les deux écritures rendent le même SQL, aucune garde ne peut les distinguer, et un nom mal
+        // écrit échoue à l'EXÉCUTION (colonnes inexistantes), pas à la compilation.
+        let a = to_sql("search | eval x = foo-bar", 0, 0, &ev).unwrap();
+        let b = to_sql("search | eval x = foo - bar", 0, 0, &ev).unwrap();
+        assert!(a.contains("(foo-bar) AS \"x\""), "{a}");
+        assert_eq!(a.replace("foo-bar", "foo - bar"), b, "les deux écritures rendent le même SQL");
+        // ET LA CONTREPARTIE : la limite est bien CIRCONSCRITE à `eval`. Les autres étapes qui prennent
+        // un nom de champ le valident, elles.
+        for q in [
+            "search foo-bar=1",
+            "search | where foo-bar > 1",
+            "search | stats count by foo-bar",
+            "search | table foo-bar",
+            "search | fields foo-bar",
+            "search | sort foo-bar",
+            "search | dedup foo-bar",
+            "search | top foo-bar",
+            "search | rename foo-bar as x",
+            "search | mvexpand foo-bar",
+            "search | eventstats count by foo-bar",
+            "search | timechart count by foo-bar",
+            "metric node_load1 by foo-bar",
+        ] {
+            to_sql(q, 0, 0, &ev).expect_err(&format!("« {q} » doit refuser le nom de champ"));
+        }
+        // L'arithmétique LÉGITIME d'`eval` reste évidemment intacte (c'est elle qui interdit la garde).
+        let c = to_sql("search | eval risk = severity * 2 | table risk", 0, 0, &ev).unwrap();
+        assert!(c.contains("(severity * 2) AS \"risk\""), "{c}");
+    }
+
+    // --- NON-RÉGRESSION SUR ENTRÉE LÉGITIME RÉELLE ---------------------------------------------
+    // Les goldens ci-dessous ne sont PAS choisis pour passer : ce sont des requêtes d'analyste
+    // ordinaires (valeur quotée, en-tête HTTP quoté, texte libre à tirets, horodatage, `in` légitime,
+    // `where`, `metric ... by`), et leur SQL a été RELEVÉ PAR SONDE sur le tag public v0.2.0 (48035b9),
+    // AVANT tout correctif de ce lot. Toute la valeur du test est là : ces formes touchent exactement
+    // les mécanismes que les gardes modifient (guillemets, tirets, `in (`), et doivent rendre le MÊME
+    // SQL À L'OCTET PRÈS. Le banc `tests/plume_parity.rs` couvre les 99 requêtes livrées ; ceci couvre
+    // en plus les écritures que le corpus livré ne contient pas.
+    #[test]
+    fn legitimate_analyst_queries_still_emit_the_v0_2_0_sql() {
+        let ev = Schema::events();
+        for (q, want) in [
+            (r#"search source=sshd user="root" | stats count by src_ip"#, r#"SELECT "src_ip" AS "src_ip",COUNT(*) AS "count" FROM (SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE "source" = 'sshd' AND json_extract(fields,'$.user') = 'root') GROUP BY "src_ip""#),
+            (r#"search source="web" severity=3"#, r#"SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE "source" = 'web' AND "severity" = 3"#),
+            (r#"search source=nginx status=404 | timechart count"#, r#"SELECT (ts/900)*900 AS bucket,COUNT(*) AS "count" FROM (SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE "source" = 'nginx' AND CAST(json_extract(fields,'$.status') AS REAL) = 404) GROUP BY bucket ORDER BY bucket"#),
+            (r#"search "Accept-Encoding: gzip""#, r#"SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE message LIKE '%Accept-Encoding: gzip%'"#),
+            (r#"search "POST /login HTTP/1.1""#, r#"SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE message LIKE '%POST /login HTTP/1.1%'"#),
+            (r#"search category=malware "attachment.exe""#, r#"SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE "category" = 'malware' AND message LIKE '%attachment.exe%'"#),
+            (r#"search source=auditd "type=SYSCALL""#, r#"SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE "source" = 'auditd' AND json_extract(fields,'$.type') = 'SYSCALL'"#),
+            (r#"search rate-limit exceeded"#, r#"SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE message LIKE '%rate-limit%' AND message LIKE '%exceeded%'"#),
+            (r#"search message="user in (a,b)""#, r#"SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE "message" = 'user in (a,b)'"#),
+            (r#"search url="/path?x in (1,2)""#, r#"SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE "url" = '/path?x in (1,2)'"#),
+            (r#"search source in ("web","cloudflare")"#, r#"SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE "source" COLLATE NOCASE IN ('web','cloudflare')"#),
+            (r#"search source=web dport in (80,443,8080) | stats count by src_ip"#, r#"SELECT "src_ip" AS "src_ip",COUNT(*) AS "count" FROM (SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE CAST(json_extract(fields,'$.dport') AS REAL) IN (80,443,8080) AND "source" = 'web') GROUP BY "src_ip""#),
+            (r#"search source=svc-audit | where error!="" | sort -ts | table user,operation,path,error"#, r#"SELECT json_extract(fields,'$.user') AS "user",json_extract(fields,'$.operation') AS "operation",json_extract(fields,'$.path') AS "path",json_extract(fields,'$.error') AS "error" FROM (SELECT * FROM (SELECT * FROM (SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE "source" = 'svc-audit') WHERE json_extract(fields,'$.error') <> '') ORDER BY "ts" DESC)"#),
+            (r#"search 2026-07-25T10:00:00"#, r#"SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event WHERE message LIKE '%2026-07-25T10:00:00%'"#),
+            (r#"metric node_load1 by code,job"#, r#"SELECT ts,host,value,json_extract(labels,'$.code') AS "code",json_extract(labels,'$.job') AS "job" FROM metric WHERE name='node_load1' UNION ALL SELECT ts,host,avg AS value,json_extract(labels,'$.code') AS "code",json_extract(labels,'$.job') AS "job" FROM metric_rollup WHERE name='node_load1' ORDER BY ts"#),
+        ] {
+            assert_eq!(to_sql(q, 0, 0, &ev).unwrap(), want, "SQL modifié pour une requête légitime : {q}");
+        }
     }
 
     #[test]
