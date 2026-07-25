@@ -187,9 +187,33 @@ pub(crate) fn soql_fieldish(s: &str) -> bool {
 /// `not ` optionnel ; groupe 3 = le mot-clé `in` (sa POSITION sert au test de quotation) ; groupe 4
 /// = le DÉLIMITEUR OUVRANT de la liste ; groupe 5 = l'intérieur de la liste. `[^()]*` interdit
 /// l'imbrication (motif fini, pas de ReDoS).
+/// LES DEUX DÉLIMITEURS DE LA LISTE D'UNE CLAUSE `in`, NOMMÉS UNE SEULE FOIS. La regex ci-dessous
+/// est CONSTRUITE à partir d'eux, et le gate de perf du pré-pass (`in_prepass_possible`) les LIT
+/// d'ici : la grammaire n'est décrite qu'à cet endroit, donc en changer le délimiteur change la
+/// reconnaissance ET le gate ENSEMBLE. Avant, `(` était nommé une SECONDE fois dans `table_conds`
+/// (`first.contains('(')`) : les deux pouvaient diverger — sans danger (le gate qui n'ouvre pas
+/// SAUTE le pré-pass, la clause repart en plein-texte, aucun filtre n'est émis), mais la phrase
+/// « la grammaire est décrite à un seul endroit » était fausse. Elle est vraie maintenant.
+const IN_LIST_OPEN: char = '(';
+const IN_LIST_CLOSE: char = ')';
+
 fn in_clause_re() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"(?i)([^\s]+)\s+(not\s+)?(in)\s*(\()([^()]*)\)").unwrap())
+    RE.get_or_init(|| {
+        let o = regex::escape(&IN_LIST_OPEN.to_string());
+        let c = regex::escape(&IN_LIST_CLOSE.to_string());
+        // IDENTIQUE À L'OCTET à l'ancienne littérale quand (o,c) == ('(' ,')') :
+        // `(?i)([^\s]+)\s+(not\s+)?(in)\s*(\()([^()]*)\)` — vérifié par test.
+        regex::Regex::new(&format!(r"(?i)([^\s]+)\s+(not\s+)?(in)\s*({o})([^{o}{c}]*){c}")).unwrap()
+    })
+}
+
+/// LE PRÉ-PASS `in` PEUT-IL TROUVER QUELQUE CHOSE ICI ? PERF SEULEMENT : évite de lancer la regex
+/// sur un filtre qui ne peut contenir aucune liste. DÉRIVÉ du délimiteur ci-dessus, donc il suit la
+/// grammaire au lieu de la répéter. Propriété qui le rend sûr, et qui est TESTÉE : un texte que la
+/// regex reconnaîtrait ouvre forcément ce gate (il contient le délimiteur ouvrant).
+pub(crate) fn in_prepass_possible(s: &str) -> bool {
+    s.contains(IN_LIST_OPEN)
 }
 
 /// TRUE si l'octet `pos` de `s` tombe À L'INTÉRIEUR d'un littéral entre guillemets (nombre de `"`
@@ -280,9 +304,31 @@ impl<'a> InClause<'a> {
         self.negate
     }
 
-    /// Valeurs de la liste : split sur `,`, trim, retrait des guillemets, vides jetées.
+    /// LES VALEURS DE LA LISTE. LA PORTE VOISINE DE `FieldList`, ET SA FRONTIÈRE, ÉCRITE ICI —
+    /// c'est une LISTE DE VALEURS, pas une liste de NOMS DE CHAMPS, et les deux ne peuvent pas
+    /// décider pareil parce que leurs DOMAINES diffèrent : la chaîne vide n'est PAS un nom de champ
+    /// (`soql_ident_ok("")` est faux -> `FieldList` refuse), mais c'est une VALEUR légitime (un
+    /// événement peut porter `host=''`).
+    ///
+    /// CE QUI EST TESTÉ EST DONC LE TEXTE ÉCRIT, PAS LA VALEUR OBTENUE — l'ordre des deux opérations
+    /// est la décision :
+    ///  - une entrée dont le TEXTE est vide n'est PAS une valeur : c'est une SUITE DE SÉPARATEURS,
+    ///    indiscernable d'un seul (`in (a,,b)` == `in (a,b)`), exactement comme `table a,,b` rend
+    ///    `a` et `b`. LIMITE ASSUMÉE ET MESURÉE, de même forme que celle de `commas_or_blanks`.
+    ///  - une entrée ÉCRITE `""` est la chaîne vide DEMANDÉE et elle SURVIT (`in ("",b)` rend
+    ///    `IN ('','b')`) : elle est filtrée AVANT le retrait des guillemets, sinon elle devenait
+    ///    indiscernable d'un séparateur et disparaissait sans un mot (mesuré avant : `IN ('b')`).
+    ///
+    /// La LISTE ENTIÈREMENT vide (`in ()`, `in (,,)`) rend zéro valeur : CORE-4 la replie sur
+    /// `1=0`/`1=1` chez l'appelant, SQLite n'ayant pas de `IN ()`. Les trims autour de la valeur sont
+    /// conservés VERBATIM (parité Plume).
     pub(crate) fn values(&self) -> Vec<String> {
-        self.list.split(',').map(|v| v.trim().trim_matches('"').trim().to_string()).filter(|v| !v.is_empty()).collect()
+        self.list
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.trim_matches('"').trim().to_string())
+            .collect()
     }
 
     /// CORE-1 : une clause n'est RÉELLE que si SES DEUX BOUTS — le début du jeton ET le mot-clé `in` —
@@ -799,4 +845,80 @@ pub(crate) fn parse_value_filter(tok: &str) -> Option<(&'static str, f64)> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------------------------
+// LA GRAMMAIRE DE LA CLAUSE `in` N'EST DÉCRITE QU'ICI — MESURÉ, PAS AFFIRMÉ.
+//
+// Ce test vit DANS `helpers` parce que la regex est PRIVÉE et doit le rester : c'est cette privauté
+// qui interdit à tout appelant de lire un fragment de jeton. `#[cfg(test)]` ne compile rien dans la
+// bibliothèque et n'ouvre aucune visibilité à un autre module.
+// ---------------------------------------------------------------------------------------------
+#[cfg(test)]
+mod grammar_named_once {
+    use super::*;
+
+    /// DEUX alphabets, TOUS les assemblages jusqu'à une longueur donnée — aucun cas choisi à la main :
+    ///  - le premier ne contient que des atomes UTILES à la grammaire : il est DENSE en vraies clauses ;
+    ///  - le second est LARGE (guillemet, négation, et un délimiteur ÉTRANGER `{`/`}` que le code ne
+    ///    nomme nulle part) : il est peu dense mais explore ce que la grammaire ne connaît pas.
+    const CORPORA: [(&[&str], u32); 2] = [
+        (&["a", " ", "in", ",", "(", ")"], 7),
+        (&["a", " ", "in", "not", ",", "\"", "(", ")", "{", "}"], 5),
+    ];
+
+    /// Engendre les formes SANS les matérialiser (compte en base N sur l'alphabet) : l'empreinte
+    /// mémoire du test est celle d'UNE forme, pas des 447 034.
+    fn for_each_form(mut f: impl FnMut(&str)) {
+        let mut buf = String::new();
+        for (alpha, maxlen) in CORPORA {
+            let n = alpha.len() as u64;
+            for len in 0..=maxlen {
+                for mut idx in 0..n.pow(len) {
+                    buf.clear();
+                    for _ in 0..len {
+                        buf.push_str(alpha[(idx % n) as usize]);
+                        idx /= n;
+                    }
+                    f(&buf);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_grammar_is_read_from_one_place_and_the_perf_gate_follows_it() {
+        // DEUX PROPRIÉTÉS, UN SEUL PARCOURS (le parcours est le coût, pas les assertions) :
+        //
+        // (1) ÉQUIVALENCE. La regex est désormais CONSTRUITE à partir de `IN_LIST_OPEN`/`IN_LIST_CLOSE`
+        //     au lieu d'être écrite en dur. Elle n'est PAS identique à l'octet à la littérale de v0.2.0
+        //     (`regex::escape` rend `[^\(\)]` là où elle écrivait `[^()]`) — ce qui est épinglé ici est
+        //     plus fort : sur TOUTES les formes engendrées, les deux rendent LES MÊMES CAPTURES.
+        //
+        // (2) LE GATE SUIT LA GRAMMAIRE. Tout texte que la regex reconnaît OUVRE le gate de perf. Le
+        //     gate ne peut donc jamais faire SAUTER une clause réelle, et il n'a plus à répéter le
+        //     délimiteur pour cela : il le LIT là où la grammaire est décrite. Avant, `(` était nommé
+        //     une SECONDE fois dans `table_conds` et les deux pouvaient diverger.
+        let historic = regex::Regex::new(r"(?i)([^\s]+)\s+(not\s+)?(in)\s*(\()([^()]*)\)").unwrap();
+        let (mut forms, mut seen) = (0u64, 0u64);
+        for_each_form(|w| {
+            forms += 1;
+            let g = |c: regex::Captures| -> Vec<Option<String>> {
+                (0..=5).map(|i| c.get(i).map(|m| m.as_str().to_string())).collect()
+            };
+            match (in_clause_re().captures(w), historic.captures(w)) {
+                (None, None) => {}
+                (Some(x), Some(y)) => {
+                    seen += 1;
+                    assert_eq!(g(x), g(y), "captures divergentes sur {w:?}");
+                    assert!(in_prepass_possible(w), "le gate saute une clause reconnue : {w:?}");
+                }
+                _ => panic!("la reconnaissance a changé sur {w:?}"),
+            }
+        });
+        // Les deux chiffres sont MESURÉS : ils font échouer le test si le corpus rétrécit en silence
+        // ou s'il cesse de contenir de vraies clauses (un test qui passe à vide ne prouve rien).
+        assert_eq!(forms, 447_034, "l'alphabet ou la longueur ont changé sans le dire");
+        assert_eq!(seen, 1_139, "le nombre de clauses reconnues a changé");
+    }
 }

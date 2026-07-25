@@ -442,21 +442,19 @@ pub(crate) fn compile_lookup(toks: &[&str], mut sql: String, mut ocols: Vec<Stri
     if !soql_ident_ok(keyfield) {
         return Err(format!("lookup : champ-clé invalide : {keyfield}"));
     }
-    // OUTPUT col1,col2 (optionnel) : colonnes du JSON `val` à exposer (virgule ou espace).
+    // OUTPUT col1,col2 (OPTIONNEL — mais une fois TAPÉ, c'est une DEMANDE EXPLICITE). MÊME PORTE que
+    // `by`/`fields`/`dedup`/`table`, et MÊME GRAMMAIRE que `table` : le BLANC y est aussi séparateur
+    // (`OUTPUT a b` == `OUTPUT a,b`, mesuré) -> `commas_or_blanks`. Mesuré AVANT (identique de v0.2.0 à
+    // 08a6593) : `OUTPUT` nu et `OUTPUT ,` retombaient sur la branche « OUTPUT absent » et la projection
+    // DEMANDÉE s'évaporait sans un mot ; `OUTPUT ,a` jetait l'entrée vide en silence. La porte valide
+    // aussi chaque entrée (`soql_ident_ok`), donc il n'y a plus de 2e contrôle à écrire ici.
+    // `lookup` SANS `OUTPUT` reste le passe-plat documenté (expose `val` brut) : rien n'a été demandé.
     let out_cols: Vec<String> = match toks.iter().position(|w| w.eq_ignore_ascii_case("output")) {
-        Some(oi) => toks[oi + 1..]
-            .join(" ")
-            .split(|c| c == ',' || c == ' ')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect(),
+        Some(oi) => FieldList::commas_or_blanks(&toks[oi + 1..].join(" "))
+            .map_err(|bad| format!("lookup : colonne OUTPUT invalide : {bad}"))?
+            .into_vec(),
         None => Vec::new(),
     };
-    for c in &out_cols {
-        if !soql_ident_ok(c) {
-            return Err(format!("lookup : colonne OUTPUT invalide : {c}"));
-        }
-    }
     let keyexpr = soql_field(keyfield, &ocols, jf, d);
     let nameesc = d.escape_literal(name);
     if out_cols.is_empty() {
