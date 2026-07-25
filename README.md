@@ -36,9 +36,9 @@ let c = compile("search severity=HIGH | stats count by mitre | sort -count", &Sc
 // délégué au `Dialect` de la cible (SQLite/DuckDB/ClickHouse), c'est le point d'étranglement unique.
 ```
 ```sh
-cargo test                   # 153 tests (147 unitaires + 5 parité différentielle + 1 doctest)
-cargo test --features forge  # 173 tests (schéma + tests Forge activés)
-cargo test --all-features    # 182 tests (+ modules `ai` et `cold_tier`)
+cargo test                   # 154 tests (148 unitaires + 5 parité différentielle + 1 doctest)
+cargo test --features forge  # 174 tests (schéma + tests Forge activés)
+cargo test --all-features    # 183 tests (+ modules `ai` et `cold_tier`)
 ```
 
 ### Nom de champ et recherche plein-texte
@@ -90,10 +90,18 @@ prennent un nom de champ (`where`, `stats by`, `table`, `fields`, `sort`, `dedup
 `mvexpand`, `eventstats`, `timechart by`, `metric by`) le valident (test
 `eval_is_the_documented_blind_spot_of_the_field_name_guard`).
 
-**Une liste `by` est décidée à un seul endroit** (`ByLabels::parse`), pour les quatre étapes qui en
-prennent une (`stats by`, `timechart by`, `eventstats by`, `metric by`) : aucun label n'y est jeté, donc
-un `by` demandé ne peut pas s'évaporer en silence. Mesuré, refusé partout : `by`, `by ,`, `by ,src_ip`,
-`by src_ip,`, `by src_ip,,host`.
+**Une liste de champs séparée par des virgules est décidée à un seul endroit** (`FieldList`), pour
+toutes les étapes qui en prennent une : `stats by`, `timechart by`, `eventstats by`, `metric by`,
+`fields`, `dedup` et `table`. Aucune entrée n'y est jetée, donc une liste demandée ne peut pas
+s'évaporer en silence ni émettre du SQL invalide. Mesuré, refusé partout où le séparateur est la
+**virgule seule** : `by`, `by ,`, `by ,src_ip`, `by src_ip,`, `by src_ip,,host`, `fields`, `fields ,`,
+`fields ,src_ip`, `dedup ,src_ip`.
+
+`table` a une grammaire différente — le **blanc** y est aussi un séparateur (`table a b` est légitime,
+mesuré) — donc une *suite* de séparateurs y est indiscernable d'un seul et se réduit : `table a,,b`
+rend `a` et `b` (limite assumée, mesurée). Ce qui reste fermé : `table ,` est refusé au lieu de
+disparaître. `table *` et `table` nu restent des **passe-plat délibérés** (ils ne restreignent pas la
+projection), inchangés.
 
 ### Bornes de compilation (le texte de requête est une entrée NON FIABLE)
 La compilation a lieu **avant** tout budget d'exécution du store : elle porte donc ses propres bornes.
@@ -126,7 +134,7 @@ demande **pas** de redémarrer le service ; en revanche une valeur valide déjà
 redémarrage.
 
 ## Statut
-- ✅ Compilateur de Plume **promu + généralisé** ici (16 étapes, schéma-générique). Suite complète : 153 tests (173 avec `--features forge`).
+- ✅ Compilateur de Plume **promu + généralisé** ici (16 étapes, schéma-générique). Suite complète : 154 tests (174 avec `--features forge`).
 - ✅ Consommé par la console Forge et par Plume via une **git-dep épinglée par tag** :
   `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.0" }` — un clone autonome de
   l'un ou l'autre produit compile sans avoir ce dépôt en voisin.

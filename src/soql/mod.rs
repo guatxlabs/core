@@ -608,13 +608,13 @@ fn metric_base(spec: &str, from: i64, to: i64, row_filter: Option<&RowFilter>, d
     while i < toks.len() {
         if toks[i] == "by" {
             // S10 — LA MÊME PORTE QUE LES TROIS AUTRES ÉTAPES À `by` (`stats`, `timechart`,
-            // `eventstats` via `by_fields`) : `ByLabels::parse` décide, ici comme là-bas. Aucun label
+            // `eventstats` via `by_fields`) : `FieldList::commas` décide, ici comme là-bas. Aucun label
             // n'est jeté ; `by` NU donne `"".split(',')` = UN label vide, refusé comme les autres.
             // Le libellé nomme ce que l'UTILISATEUR a écrit, pas un « label » qu'il n'a jamais écrit :
             // `by` JOINT ses jetons avec un espace avant de couper sur les virgules, donc `by code extra`
             // produit le pseudo-label « code extra ». On rappelle le séparateur attendu.
             let joined = toks[i + 1..].join(" ");
-            bylabels = ByLabels::parse(&joined)
+            bylabels = FieldList::commas(&joined)
                 .map_err(|bad| format!(
                     "metric : label invalide dans `by` : « {bad} » (les labels de `by` se séparent par des virgules : `by code,job`)"
                 ))?
@@ -658,7 +658,7 @@ fn metric_base(spec: &str, from: i64, to: i64, row_filter: Option<&RowFilter>, d
     let mut selr = "ts,host,avg AS value".to_string();
     let mut ocols: Vec<String> = vec!["ts".into(), "host".into(), "value".into()];
     for l in &bylabels {
-        // Les labels sont DÉJÀ validés (`ByLabels::parse`, au jeton `by` ci-dessus) : il ne reste ici
+        // Les labels sont DÉJÀ validés (`FieldList::commas`, au jeton `by` ci-dessus) : il ne reste ici
         // que l'émission.
         sel.push_str(&format!(",{} AS {}", d.json_extract("labels", l), soql_qid(l)));
         selr.push_str(&format!(",{} AS {}", d.json_extract("labels", l), soql_qid(l)));
@@ -1087,11 +1087,12 @@ pub fn compile_with_time(soql: &str, from: i64, to: i64, schema: &Schema) -> Res
 /// - `sel`    : `["<soql_field> AS <qid>", ...]` (projection des champs de groupe) ;
 /// - `gcols`  : les identifiants quotés joints par `,` (clause GROUP BY).
 ///
-/// LA VALIDITÉ DE LA LISTE N'EST PAS DÉCIDÉE ICI : `ByLabels::parse` la décide pour les QUATRE étapes
-/// qui prennent un `by` (les trois d'ici + `metric`), cf. le bandeau de `helpers.rs`. Cette fonction ne
-/// fabrique plus que l'émission ; `label` est le préfixe d'erreur propre à l'étape.
+/// LA VALIDITÉ DE LA LISTE N'EST PAS DÉCIDÉE ICI : `FieldList::commas` la décide pour TOUTES les listes
+/// de champs séparées par des virgules (`by` des trois étapes d'ici + `metric ... by`, `fields`,
+/// `dedup`), cf. le bandeau de `helpers.rs`. Cette fonction ne fabrique plus que l'émission ; `label`
+/// est le préfixe d'erreur propre à l'étape.
 fn by_fields(raw: &str, label: &str, ocols: &[String], jf: Option<&str>, d: &dyn Dialect) -> Result<(Vec<String>, Vec<String>, String), String> {
-    let fields: Vec<String> = ByLabels::parse(raw)
+    let fields: Vec<String> = FieldList::commas(raw)
         .map_err(|bad| format!("{label}champ invalide : {bad}"))?
         .into_vec();
     let sel: Vec<String> = fields.iter().map(|f| format!("{} AS {}", soql_field(f, ocols, jf, d), soql_qid(f))).collect();
