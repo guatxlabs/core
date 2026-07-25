@@ -516,6 +516,63 @@
     }
 
     #[test]
+    fn op_lookup_output_typed_but_empty_is_refused_not_evaporated() {
+        // LA 8e ÉTAPE. `OUTPUT` TAPÉ est une demande EXPLICITE. MESURÉ AVANT ce correctif, et
+        // IDENTIQUE sur le tag public v0.2.0 (donc pré-existant, pas une régression) :
+        //   search | lookup t k OUTPUT    -> SELECT base.*, lk.val AS "t" …   <- la projection
+        //   search | lookup t k OUTPUT ,  -> idem                                DEMANDÉE s'évapore
+        //   search | lookup t k OUTPUT ,a -> l'entrée vide jetée sans un mot
+        // C'était mot pour mot le mode d'échec de `table ,`, refusé, lui, depuis le correctif
+        // précédent. Les deux passent désormais par la MÊME porte.
+        let ev = Schema::events();
+        for q in ["search | lookup t k OUTPUT", "search | lookup t k OUTPUT ,", "search | lookup t k OUTPUT ,,"] {
+            let e = to_sql(q, 0, 0, &ev).expect_err(&format!("« {q} » : OUTPUT tapé et vide"));
+            assert!(e.contains("colonne OUTPUT invalide"), "message : {e}");
+        }
+        // Le message NOMME ce qui a été tapé, comme partout ailleurs (porte commune).
+        let e = to_sql("search | lookup t k OUTPUT bad-col", 0, 0, &ev).expect_err("ident invalide");
+        assert_eq!(e, "lookup : colonne OUTPUT invalide : bad-col");
+        // ANTI-RÉGRESSION — les formes livrées rendent le SQL du tag public, à l'octet.
+        let want = "SELECT base.*, CASE WHEN json_valid(lk.val) THEN json_extract(lk.val,'$.country') END AS \"country\", \
+CASE WHEN json_valid(lk.val) THEN json_extract(lk.val,'$.asn') END AS \"asn\" FROM (SELECT ts,host,source,category,severity,\
+src_ip,dst_ip,url,xff,message,fields FROM event WHERE \"source\" = 'web') base LEFT JOIN lookup_kv lk ON lk.name='geoip' \
+AND lk.\"key\"=\"src_ip\"";
+        for q in [
+            "search source=web | lookup geoip src_ip OUTPUT country,asn",
+            // le BLANC est séparateur ici comme dans `table` : même SQL, mesuré.
+            "search source=web | lookup geoip src_ip OUTPUT country asn",
+            "search source=web | lookup geoip src_ip OUTPUT country, asn",
+        ] {
+            assert_eq!(to_sql(q, 0, 0, &ev).unwrap(), want, "forme légitime réécrite : {q}");
+        }
+        // `lookup` SANS `OUTPUT` reste le passe-plat documenté : rien n'a été demandé, rien ne manque.
+        assert!(to_sql("search | lookup users user", 0, 0, &ev).unwrap().contains("lk.val AS \"users\""));
+    }
+
+    #[test]
+    fn an_in_list_value_written_empty_survives_and_a_run_of_separators_does_not() {
+        // LA PORTE VOISINE — liste de VALEURS, pas de noms. Le domaine décide, pas la politique :
+        // la chaîne vide n'est pas un nom de champ, mais c'est une valeur légitime.
+        // MESURÉ AVANT (identique sur v0.2.0) : `search host in ("",b)` rendait `IN ('b')` — la
+        // valeur explicitement demandée disparaissait sans un mot.
+        let ev = Schema::events();
+        let b = "SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event";
+        let w = |v: &str| format!("{b} WHERE \"host\" COLLATE NOCASE IN ({v})");
+        assert_eq!(to_sql("search host in (\"\",b)", 0, 0, &ev).unwrap(), w("'','b'"));
+        assert_eq!(to_sql("search host in (a,\"\",b)", 0, 0, &ev).unwrap(), w("'a','','b'"));
+        // LIMITE ASSUMÉE, ÉCRITE : une entrée SANS AUCUN TEXTE est une suite de séparateurs,
+        // indiscernable d'un seul — exactement comme `table a,,b`.
+        assert_eq!(to_sql("search host in (a,,b)", 0, 0, &ev).unwrap(), w("'a','b'"));
+        // CORE-4 INTACT : la liste ENTIÈREMENT vide n'a aucune valeur -> repli, jamais un filtre évanoui.
+        assert_eq!(to_sql("search host in ()", 0, 0, &ev).unwrap(), format!("{b} WHERE 1=0"));
+        assert_eq!(to_sql("search host in (,,)", 0, 0, &ev).unwrap(), format!("{b} WHERE 1=0"));
+        assert_eq!(to_sql("search host not in ()", 0, 0, &ev).unwrap(), format!("{b} WHERE 1=1"));
+        // ANTI-RÉGRESSION : les formes légitimes rendent le SQL du tag public, à l'octet.
+        assert_eq!(to_sql("search host in (a,b)", 0, 0, &ev).unwrap(), w("'a','b'"));
+        assert_eq!(to_sql("search host in (\"a b\",c)", 0, 0, &ev).unwrap(), w("'a b','c'"));
+    }
+
+    #[test]
     fn op_lookup_rejects_bad_identifiers() {
         assert!(compile("search | lookup bad-name src_ip", &Schema::events()).is_err());
         assert!(compile("search | lookup geoip bad-field", &Schema::events()).is_err());
@@ -2272,6 +2329,318 @@
         for q in ["search | table *", "search | table"] {
             assert_eq!(to_sql(q, 0, 0, &ev).unwrap(), b, "passe-plat cassé : {q}");
         }
+    }
+
+    // =========================================================================================
+    // LA PORTE DES LISTES — LES CAS SONT ENGENDRÉS DEPUIS LA STRUCTURE, PAS ÉNUMÉRÉS.
+    //
+    // POURQUOI CE TEST EXISTE : la garde précédente fermait les étapes qu'on avait PENSÉ à citer, et
+    // le relecteur trouvait l'étape SUIVANTE. Elle existait déjà dans l'arbre : `lookup … OUTPUT`
+    // prend une liste de noms de champs séparée par des virgules et ne passait pas par la porte —
+    // `OUTPUT` nu et `OUTPUT ,` retombaient sur la branche « OUTPUT absent » et la projection
+    // DEMANDÉE s'évaporait sans un mot.
+    //
+    // CE TEST NE NOMME AUCUNE ÉTAPE ET AUCUN MOT-CLÉ. Il LIT le dispatcheur (`soql/mod.rs`) et les
+    // compilateurs (`soql/stages.rs`), en DÉRIVE les positions de liste, et vérifie sur chacune
+    // qu'une liste TAPÉE ne peut pas s'évaporer. Une 21e étape ajoutée demain entre dans le test
+    // sans qu'une ligne d'ici ne bouge.
+    // =========================================================================================
+
+    /// Le corps d'une fonction : de sa signature à la signature suivante de même niveau.
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let Some(p) = src.find(&format!("fn {name}(")) else { return "" };
+        let rest = &src[p..];
+        match rest[1..]
+            .find("\npub(crate) fn ")
+            .or_else(|| rest[1..].find("\nfn "))
+            .map(|k| k + 1)
+        {
+            Some(e) => &rest[..e],
+            None => rest,
+        }
+    }
+
+    /// Les littéraux d'une portion de source, dans l'ordre.
+    fn string_literals(seg: &str) -> Vec<&str> {
+        let (mut out, mut i) = (Vec::new(), 0usize);
+        while let Some(q) = seg[i..].find('"') {
+            let a = i + q + 1;
+            let Some(e) = seg[a..].find('"') else { break };
+            out.push(&seg[a..a + e]);
+            i = a + e + 1;
+        }
+        out
+    }
+
+    /// LES ÉTAPES, LUES DANS LE DISPATCHEUR : tout bras `"nom" [| "autre"] => compile_X(`.
+    fn dispatcher_steps(modsrc: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for line in modsrc.lines() {
+            let t = line.trim();
+            let Some(a) = t.find("=> compile_") else { continue };
+            let f: String = t[a + 3..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            for name in string_literals(&t[..a]) {
+                out.push((name.to_string(), f.clone()));
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// LES MOTS-CLÉS D'UNE ÉTAPE, LUS DANS SON PROPRE COMPILATEUR : un mot-clé est un littéral que
+    /// l'étape cherche PARMI SES JETONS (`toks.iter().position(|w| … "kw" …)`). C'est ce qui
+    /// distingue `stats … by` (où `by` est un mot-clé) de `table a by b` (où `by` est un nom).
+    fn keywords_of(body: &str) -> Vec<String> {
+        let (mut out, mut i) = (Vec::new(), 0usize);
+        while let Some(p) = body[i..].find("position(|w|") {
+            let s = i + p;
+            let seg = &body[s..];
+            let seg = &seg[..seg.find(')').unwrap_or(seg.len())];
+            for w in string_literals(seg) {
+                if !w.is_empty() && w.chars().all(|c| c.is_ascii_lowercase()) {
+                    out.push(w.to_string());
+                }
+            }
+            i = s + 12;
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Les préfixes d'argument engendrés : tous les mots de longueur <= 2 sur un alphabet de
+    /// remplisseurs (un nom, un agrégat, un nombre) — de quoi rendre une étape par ailleurs VALIDE
+    /// sans savoir laquelle.
+    fn arg_prefixes() -> Vec<String> {
+        let alpha = ["a", "count", "1"];
+        let mut v = vec![String::new()];
+        for x in alpha {
+            v.push(x.to_string());
+            for y in alpha {
+                v.push(format!("{x} {y}"));
+            }
+        }
+        v
+    }
+
+    /// Tous les mots NON VIDES de longueur <= 3 sur l'alphabet des SÉPARATEURS : une liste écrite
+    /// avec ça ne contient AUCUN nom.
+    fn separator_only_lists() -> Vec<String> {
+        let alpha = [",", " "];
+        let mut v = Vec::new();
+        for a in alpha {
+            v.push(a.to_string());
+            for b in alpha {
+                v.push(format!("{a}{b}"));
+                for c in alpha {
+                    v.push(format!("{a}{b}{c}"));
+                }
+            }
+        }
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    #[test]
+    fn no_typed_field_list_can_evaporate_whatever_the_step() {
+        // L'ORACLE, DÉRIVÉ ET NON ÉCRIT : une position d'argument est une LISTE DE NOMS DE CHAMPS
+        // si et seulement si CHANGER LES NOMS CHANGE LE SQL. On n'a donc pas à savoir quelles étapes
+        // en prennent une — on le MESURE, étape par étape, sur des formes engendrées.
+        //
+        // Sur toute position ainsi trouvée, la règle vérifiée est :
+        //  - MOT-CLÉ TAPÉ (`… by X`, `… OUTPUT X`) : la demande est EXPLICITE. Une liste sans aucun
+        //    nom — y compris « rien du tout après le mot-clé » — doit être REFUSÉE. Aucune exception
+        //    de grammaire : l'utilisateur a écrit le mot-clé.
+        //  - LISTE = TOUT L'ARGUMENT (`fields X`, `table X`) : idem, MAIS si le BLANC est séparateur
+        //    pour cette étape (mesuré : `S a b` == `S a,b`), alors un argument entièrement BLANC est
+        //    indiscernable d'un argument ABSENT — l'étape nue est un contrat à part (`table` nu est
+        //    un passe-plat délibéré). On n'exige donc le refus que des formes portant une VIRGULE.
+        let modsrc = include_str!("soql/mod.rs");
+        let stgsrc = include_str!("soql/stages.rs");
+        let steps = dispatcher_steps(modsrc);
+        assert!(steps.len() >= 18, "le dispatcheur n'a pas été lu : {steps:?}");
+
+        // Tous les schémas/dialectes livrés : la porte ne peut pas dépendre de la cible.
+        let schemas: Vec<(&str, Schema)> = vec![
+            ("events", Schema::events()),
+            ("events_duckdb", Schema::events_duckdb()),
+            ("events_clickhouse", Schema::events_clickhouse()),
+            #[cfg(feature = "forge")]
+            ("forge", Schema::forge()),
+        ];
+        let seps = separator_only_lists();
+        let (mut positions, mut cases) = (0usize, 0usize);
+        let mut leaks: Vec<String> = Vec::new();
+
+        for (sname, sch) in &schemas {
+            let base = if *sname == "forge" { "runs" } else { "search" };
+            let sql_of = |q: &str| to_sql(q, 0, 0, sch).ok();
+            for (step, f) in &steps {
+                let kws = keywords_of(fn_body(stgsrc, f));
+
+                // (1) LA LISTE EST TOUT L'ARGUMENT — le préfixe est forcément vide.
+                if let (Some(x), Some(y)) = (
+                    sql_of(&format!("{base} | {step} a,b")),
+                    sql_of(&format!("{base} | {step} c,d")),
+                ) {
+                    if x != y {
+                        let blank_sep = sql_of(&format!("{base} | {step} a b")).as_deref() == Some(x.as_str());
+                        positions += 1;
+                        let mut probes: Vec<String> = seps
+                            .iter()
+                            .filter(|a| !blank_sep || a.contains(','))
+                            .map(|a| format!("{base} | {step} {a}"))
+                            .collect();
+                        if !blank_sep {
+                            probes.push(format!("{base} | {step}"));
+                        }
+                        for q in probes {
+                            cases += 1;
+                            if let Some(sql) = sql_of(&q) {
+                                leaks.push(format!("[{sname}/{step}/<arg>] « {q} » a compilé : {sql}"));
+                            }
+                        }
+                    }
+                }
+
+                // (2) UN MOT-CLÉ A ÉTÉ TAPÉ — la demande est explicite, aucune exception.
+                for k in &kws {
+                    for p in arg_prefixes() {
+                        let (Some(x), Some(y)) = (
+                            sql_of(&format!("{base} | {step} {p} {k} a,b")),
+                            sql_of(&format!("{base} | {step} {p} {k} c,d")),
+                        ) else {
+                            continue;
+                        };
+                        if x == y {
+                            continue;
+                        }
+                        positions += 1;
+                        let mut probes: Vec<String> =
+                            seps.iter().map(|z| format!("{base} | {step} {p} {k} {z}")).collect();
+                        probes.push(format!("{base} | {step} {p} {k}"));
+                        for q in probes {
+                            cases += 1;
+                            if let Some(sql) = sql_of(&q) {
+                                leaks.push(format!("[{sname}/{step}/{k}] « {q} » a compilé : {sql}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            leaks.is_empty(),
+            "une liste demandée s'est évaporée ({} sur {cases} cas) :\n{}",
+            leaks.len(),
+            leaks.join("\n")
+        );
+        // Un test qui ne trouve AUCUNE position de liste passerait à vide : on le dit avec un chiffre
+        // MESURÉ, qui échoue si la dérivation cesse de voir les étapes.
+        assert!(positions >= 28, "positions de liste trouvées : {positions} (dérivation cassée ?)");
+    }
+
+    #[test]
+    fn every_comma_split_of_the_compiler_is_the_door_or_a_written_exception() {
+        // L'AUTRE MOITIÉ DE LA DÉRIVATION. Le test ci-dessus prouve qu'aucune position de liste
+        // CONNUE DU DISPATCHEUR ne laisse s'évaporer une liste ; celui-ci ferme la façon dont la
+        // 8e étape avait échappé à la porte : elle DÉCOUPAIT LA CHAÎNE ELLE-MÊME. Le type ne peut
+        // pas l'interdire (rien n'oblige une étape à demander une `FieldList`), alors on le lit
+        // DANS LA SOURCE : tout découpage sur la virgule est soit la porte, soit une exception
+        // ÉCRITE ICI AVEC SA RAISON. Un 6e site apparaît -> ce test échoue, et le contributeur lit
+        // quoi faire. Aucune étape n'est nommée : c'est la FORME du défaut qui est interdite.
+        const DECLARED: [(&str, &str, &str); 5] = [
+            ("helpers.rs", "commas", "LA PORTE — virgule seule (`by`, `fields`, `dedup`)"),
+            ("helpers.rs", "commas_or_blanks", "LA PORTE — virgule ou blanc (`table`, `lookup … OUTPUT`)"),
+            ("helpers.rs", "values", "liste de VALEURS, pas de noms : la chaîne vide y est une valeur légitime (cf. `InClause::values`)"),
+            ("stages.rs", "compile_rename", "liste de PAIRES `a AS b` : chaque segment est validé, une liste vide est refusée — rien n'y est jeté"),
+            ("knowledge.rs", "parse_macro_call", "arguments d'appel de MACRO, pas des noms de champs ; aucune entrée n'y est jetée"),
+        ];
+        // `include_str!` exige un chemin LITTÉRAL : la liste des fichiers ne peut pas être calculée.
+        // Elle est donc VÉRIFIÉE juste après, contre les `mod …;` déclarés par `soql/mod.rs` — un
+        // sous-module ajouté sans être lu ici fait échouer le test au lieu de créer un angle mort.
+        let files: [(&str, &str); 6] = [
+            ("mod.rs", include_str!("soql/mod.rs")),
+            ("helpers.rs", include_str!("soql/helpers.rs")),
+            ("stages.rs", include_str!("soql/stages.rs")),
+            ("knowledge.rs", include_str!("soql/knowledge.rs")),
+            ("dialect.rs", include_str!("soql/dialect.rs")),
+            ("mask.rs", include_str!("soql/mask.rs")),
+        ];
+        let declared_mods: Vec<String> = files[0]
+            .1
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("mod ").and_then(|r| r.strip_suffix(';')))
+            .filter(|m| *m != "tests")
+            .map(|m| format!("{m}.rs"))
+            .collect();
+        let unread: Vec<&String> = declared_mods.iter().filter(|m| !files.iter().any(|(f, _)| f == m)).collect();
+        assert!(unread.is_empty(), "sous-module déclaré mais non relu par ce test : {unread:?}");
+        let mut found: Vec<(String, String)> = Vec::new();
+        for (fname, src) in files {
+            let mut cur = String::new();
+            for line in src.lines() {
+                // Les commentaires (`//`, `///`) ne sont PAS du code : ils citent la grammaire.
+                let code = match line.find("//") {
+                    Some(i) => &line[..i],
+                    None => line,
+                };
+                if let Some(i) = code.find("fn ") {
+                    let n: String = code[i + 3..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    if !n.is_empty() && code[i + 3 + n.len()..].starts_with('(') {
+                        cur = n;
+                    }
+                }
+                if code.contains(".split(") && code.contains("','") {
+                    found.push((fname.to_string(), cur.clone()));
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        let declared: Vec<(String, String)> =
+            DECLARED.iter().map(|(f, n, _)| (f.to_string(), n.to_string())).collect();
+        let mut d = declared.clone();
+        d.sort();
+        assert_eq!(
+            found, d,
+            "un découpage sur la virgule a été ajouté ou retiré. S'il produit des NOMS DE CHAMPS, il \
+             doit passer par `FieldList::commas`/`commas_or_blanks` ; sinon, déclare-le ici AVEC SA \
+             RAISON.\ntrouvés : {found:?}\ndéclarés : {d:?}"
+        );
+    }
+
+    #[test]
+    fn the_readme_step_count_is_the_one_the_dispatcher_gives() {
+        // UN CHIFFRE PUBLIÉ EST UNE AFFIRMATION : un exploitant dimensionne avec. « 16 étapes » ne se
+        // réconciliait avec AUCUNE lecture du code (le dispatcheur a 18 bras et accepte 20 noms) —
+        // c'était le compteur de la LISTE ÉCRITE À CÔTÉ, laquelle avait cessé de suivre le code
+        // (`rename`, `mvexpand`, `lookup`, `limit` en manquaient). Le README dit maintenant les DEUX
+        // lectures, et c'est CE TEST qui les rend vraies : elles ne peuvent plus dériver en silence.
+        let modsrc = include_str!("soql/mod.rs");
+        let steps = dispatcher_steps(modsrc);
+        let arms = modsrc
+            .lines()
+            .filter(|l| l.trim_start().starts_with('"') && l.contains("=> compile_"))
+            .count();
+        let readme = include_str!("../README.md");
+        assert_eq!(arms, 18, "bras du dispatcheur");
+        assert_eq!(steps.len(), 20, "noms d'étape acceptés");
+        for claim in [
+            format!("{arms} étapes de pipeline"),
+            format!("{} noms", steps.len()),
+        ] {
+            assert!(readme.contains(&claim), "le README ne porte pas « {claim} »");
+        }
+        // Et chaque nom accepté est CITÉ dans le README : la liste ne peut plus être incomplète.
+        let missing: Vec<&str> = steps
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .filter(|n| !readme.contains(&format!("`{n}`")))
+            .collect();
+        assert!(missing.is_empty(), "étapes acceptées mais absentes du README : {missing:?}");
     }
 
     #[test]
