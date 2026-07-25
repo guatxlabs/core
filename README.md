@@ -36,9 +36,9 @@ let c = compile("search severity=HIGH | stats count by mitre | sort -count", &Sc
 // délégué au `Dialect` de la cible (SQLite/DuckDB/ClickHouse), c'est le point d'étranglement unique.
 ```
 ```sh
-cargo test                   # 150 tests (144 unitaires + 5 parité différentielle + 1 doctest)
-cargo test --features forge  # 170 tests (schéma + tests Forge activés)
-cargo test --all-features    # 179 tests (+ modules `ai` et `cold_tier`)
+cargo test                   # 153 tests (147 unitaires + 5 parité différentielle + 1 doctest)
+cargo test --features forge  # 173 tests (schéma + tests Forge activés)
+cargo test --all-features    # 182 tests (+ modules `ai` et `cold_tier`)
 ```
 
 ### Nom de champ et recherche plein-texte
@@ -51,14 +51,20 @@ nomme cette partie gauche. Sont concernées les deux syntaxes de filtre :
 | Syntaxe | Ce qui décide du nom | Refusé |
 |---|---|---|
 | jeton `nom<op>valeur` (`=` `:` `!=` `>=` `<=` `>` `<` `=~`), collé ou espacé | la partie gauche de l'opérateur, blancs délimiteurs retirés | `x-forwarded-for=1.2.3.4` · `http.status>=500` · `foo-bar = 1` · `x-forwarded-for="10.0.0.1"` (guillemeter la *valeur* n'exempte pas) |
-| clause `nom [not] in (…)` | tout ce qui précède `in` jusqu'à la frontière du jeton (espace, début, `(`) — **pas** une classe de caractères | `src-ip in (10,11)` · `cache/status in (200,302)` · `user@host in (1,2)` · `-foo in (1,2)` |
+| clause `nom [not] in (…)` | tout ce qui précède `in` jusqu'à la frontière du jeton (le **blanc**, la seule de ce langage), **moins** les parenthèses ouvrantes de tête, qui sont du groupement — **pas** une classe de caractères | `src-ip in (10,11)` · `cache/status in (200,302)` · `user@host in (1,2)` · `-foo in (1,2)` · `foo(host in (1,2)` · `count(src_ip in (10,11))` |
 
 Le laisser filer donnerait un scan plein-texte non borné — ou, pour `in (…)`, un filtre sur un *autre*
 champ que celui écrit (le suffixe après le séparateur) : dans les deux cas un jeu de lignes différent
 de celui demandé, sans un mot. La garde vaut aux mêmes conditions dans une sous-recherche
 (`append […]`, `join f […]`), à toute profondeur.
 
-**Ce qui n'est PAS refusé.** Une **phrase quotée** reste une recherche plein-texte, inchangée :
+**Ce qui n'est PAS refusé.** Une parenthèse ouvrante **de tête** est du **groupement**, pas une partie
+du nom : elle est retirée de la tête du jeton, remise dans le texte du filtre, et le reste doit être un
+identifiant entier. Mesuré : `search (dport in (80,443))` et `search ((foo in (1,2)))` rendent le SQL
+de v0.2.0 à l'octet près, tandis que `search foo(host in (1,2)` est refusé. Le peeling n'a lieu qu'**en
+tête** : `search (a) in (1,2)` réclame `a)` et est refusé.
+
+Une **phrase quotée** reste une recherche plein-texte, inchangée :
 `search "user-agent=curl/7.68"`, `search "x-forwarded-for in (1,2)"`, `search "foo-bar"=1`. La
 quotation compte pour ce qu'elle couvre à **gauche de l'opérateur**, pas pour le fait qu'il y ait un
 guillemet quelque part : `search source="web"` reste le filtre indexé `"source" = 'web'`, et
@@ -74,12 +80,20 @@ jamais), le texte suggéré est le vôtre *sans ses guillemets internes* : `sear
 plein-texte vers laquelle se rabattre.
 
 **Limite mesurée, non fermée :** cette garde n'existe pas dans `eval`, et ne peut pas y exister — dans
-une expression, `-` est l'opérateur de soustraction. `search | eval x = foo-bar` émet `(foo-bar)`,
-c'est-à-dire exactement le SQL de `eval x = foo - bar` ; un nom mal écrit y échoue donc à
-l'**exécution** (colonne inexistante) et non à la compilation. Les autres étapes qui prennent un nom
-de champ (`where`, `stats by`, `table`, `fields`, `sort`, `dedup`, `top`, `rename`, `mvexpand`,
-`eventstats`, `timechart by`, `metric by`) le valident (test
+une expression, `-` est l'opérateur de soustraction. `search | eval x = foo-bar` émet `(foo-bar)` et
+`eval x = foo - bar` émet `(foo - bar)` : **ces deux SQL ne sont pas identiques à l'octet** — ils ne
+diffèrent que par des blancs (mesuré par le test ci-dessous), et SQLite les compile en le **même
+programme** (mesuré : `EXPLAIN SELECT (foo-bar) FROM t` et `EXPLAIN SELECT (foo - bar) FROM t` rendent
+un bytecode identique, sqlite 3.53.3). Rien dans l'entrée ne sépare donc les deux lectures ; un nom mal
+écrit y échoue à l'**exécution** (colonne inexistante) et non à la compilation. Les autres étapes qui
+prennent un nom de champ (`where`, `stats by`, `table`, `fields`, `sort`, `dedup`, `top`, `rename`,
+`mvexpand`, `eventstats`, `timechart by`, `metric by`) le valident (test
 `eval_is_the_documented_blind_spot_of_the_field_name_guard`).
+
+**Une liste `by` est décidée à un seul endroit** (`ByLabels::parse`), pour les quatre étapes qui en
+prennent une (`stats by`, `timechart by`, `eventstats by`, `metric by`) : aucun label n'y est jeté, donc
+un `by` demandé ne peut pas s'évaporer en silence. Mesuré, refusé partout : `by`, `by ,`, `by ,src_ip`,
+`by src_ip,`, `by src_ip,,host`.
 
 ### Bornes de compilation (le texte de requête est une entrée NON FIABLE)
 La compilation a lieu **avant** tout budget d'exécution du store : elle porte donc ses propres bornes.
@@ -112,7 +126,7 @@ demande **pas** de redémarrer le service ; en revanche une valeur valide déjà
 redémarrage.
 
 ## Statut
-- ✅ Compilateur de Plume **promu + généralisé** ici (16 étapes, schéma-générique). Suite complète : 150 tests (170 avec `--features forge`).
+- ✅ Compilateur de Plume **promu + généralisé** ici (16 étapes, schéma-générique). Suite complète : 153 tests (173 avec `--features forge`).
 - ✅ Consommé par la console Forge et par Plume via une **git-dep épinglée par tag** :
   `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.0" }` — un clone autonome de
   l'un ou l'autre produit compile sans avoir ce dépôt en voisin.
