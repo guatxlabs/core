@@ -1511,3 +1511,26 @@
         }
     }
 
+    // --- S10 : `metric` — un label invalide ne fait plus DISPARAÎTRE le filtre/groupement -------
+    #[test]
+    fn s10_metric_invalid_label_filter_is_error() {
+        // Mesuré : `metric node_load1 foo-bar=1` -> le filtre DISPARAISSAIT et la requête renvoyait
+        // TOUTES les séries de la métrique (règle de détection qui ne mesure plus ce qu'elle croit).
+        let e = to_sql("metric node_load1 foo-bar=1", 0, 0, &Schema::events())
+            .expect_err("un label invalide doit être refusé, pas ignoré");
+        assert!(e.contains("foo-bar"), "l'erreur doit nommer le label : {e}");
+        // Contre-preuve : un label valide filtre toujours.
+        let ok = to_sql("metric http_requests_total job=api", 0, 0, &Schema::events()).unwrap();
+        assert!(ok.contains("json_extract(labels,'$.job')='api'"), "{ok}");
+    }
+
+    #[test]
+    fn s10_metric_invalid_by_label_is_error() {
+        // Mesuré : `metric node_load1 by foo-bar` -> le GROUPEMENT disparaissait silencieusement.
+        let e = to_sql("metric node_load1 by foo-bar", 0, 0, &Schema::events())
+            .expect_err("un label de `by` invalide doit être refusé, pas ignoré");
+        assert!(e.contains("foo-bar"), "l'erreur doit nommer le label : {e}");
+        let ok = to_sql("metric http_requests_total by code", 0, 0, &Schema::events()).unwrap();
+        assert!(ok.contains("json_extract(labels,'$.code')"), "{ok}");
+    }
+
