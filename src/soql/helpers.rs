@@ -56,10 +56,13 @@ pub(crate) fn soql_ident_ok(s: &str) -> bool {
 }
 
 /// TRUE si `s` a la FORME d'un nom de champ, c'est-à-dire si un jeton `s<op>valeur` PRÉTEND filtrer un
-/// champ : commence par une lettre ASCII ou `_`, et ne contient que `[A-Za-z0-9_.-]`. Sert UNIQUEMENT à
-/// distinguer un nom de champ MAL ÉCRIT (`x-forwarded-for`, `http.status` -> erreur explicite, cf.
-/// `table_conds`) d'un VRAI terme libre (phrase quotée, horodatage `10:00:00`, chemin/URL) qui garde le
-/// scan plein-texte. Un identifiant VALIDE (`soql_ident_ok`) est un sous-ensemble de cette forme.
+/// champ : commence par une lettre ASCII ou `_`, et ne contient que `[A-Za-z0-9_.-]`. Sert à distinguer
+/// un nom de champ MAL ÉCRIT (`x-forwarded-for`, `http.status` -> erreur explicite) d'un terme dont la
+/// partie gauche ne prétend pas nommer un champ (horodatage `10:00:00`, chemin/URL), qui garde le scan
+/// plein-texte. Un identifiant VALIDE (`soql_ident_ok`) est un sous-ensemble de cette forme.
+/// DEUX APPELANTS, tous deux dans `mod.rs` : le recollage `soql_glue_spaced_ops` (pour que la forme
+/// espacée `foo-bar = 1` redevienne UN jeton) et la garde de `table_conds`. Une PHRASE QUOTÉE est
+/// exemptée en amont sur le marqueur de `soql_tokenize_marked`, PAS par cette fonction.
 pub(crate) fn soql_fieldish(s: &str) -> bool {
     let mut cs = s.chars();
     matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
