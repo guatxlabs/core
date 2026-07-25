@@ -36,13 +36,28 @@ let c = compile("search severity=HIGH | stats count by mitre | sort -count", &Sc
 // délégué au `Dialect` de la cible (SQLite/DuckDB/ClickHouse), c'est le point d'étranglement unique.
 ```
 ```sh
-cargo test                   # 110 tests (104 unitaires + 5 parité différentielle + 1 doctest)
-cargo test --features forge  # 130 tests (schéma + tests Forge activés)
-cargo test --all-features    # 139 tests (+ modules `ai` et `cold_tier`)
+cargo test                   # 121 tests (115 unitaires + 5 parité différentielle + 1 doctest)
+cargo test --features forge  # 141 tests (schéma + tests Forge activés)
+cargo test --all-features    # 150 tests (+ modules `ai` et `cold_tier`)
 ```
 
+### Bornes de compilation (le texte de requête est une entrée NON FIABLE)
+La compilation a lieu **avant** tout budget d'exécution du store : elle porte donc ses propres bornes.
+Chacune a un défaut sûr et se règle par l'environnement. **Au dépassement, une erreur claire est rendue
+à l'appelant** — jamais un panic, jamais une valeur substituée en silence, jamais un buffer illimité.
+
+| Variable | Défaut | Ce qu'elle borne |
+|---|---|---|
+| `GUATX_SOQL_MAX_SPAN_SECS` | `315360000` (10 ans) | le bucket `timechart span=` (secondes) |
+| `GUATX_SOQL_MAX_STAGES` | `64` | le nombre d'étapes de pipe d'un pipeline |
+| `GUATX_SOQL_MAX_SQL_BYTES` | `1048576` (1 Mio) | la taille du SQL émis, vérifiée après chaque étape |
+
+Une variable **présente mais illisible** (non numérique, ≤ 0) est signalée comme une erreur de
+configuration, et non ramenée en silence au défaut : une borne que l'opérateur croit avoir posée ne doit
+jamais être ignorée sans le dire.
+
 ## Statut
-- ✅ Compilateur de Plume **promu + généralisé** ici (16 étapes, schéma-générique). Suite complète : 110 tests (130 avec `--features forge`).
+- ✅ Compilateur de Plume **promu + généralisé** ici (16 étapes, schéma-générique). Suite complète : 121 tests (141 avec `--features forge`).
 - ✅ Consommé par la console Forge et par Plume via une **git-dep épinglée par tag** :
   `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.0" }` — un clone autonome de
   l'un ou l'autre produit compile sans avoir ce dépôt en voisin.
