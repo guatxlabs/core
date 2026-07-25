@@ -150,7 +150,12 @@ pub fn parse_stix_pattern(pattern: &str) -> Result<Vec<(&'static str, String)>, 
         return Err("empty pattern".into());
     }
     // Reject qualifiers / multi-observation operators outright (case-insensitive word check).
-    let up = p.to_ascii_uppercase();
+    // The check runs on the pattern's STRUCTURE ONLY (`pattern_structure` blanks out the content of
+    // quoted string literals): an operator name is a token of the pattern, never part of a value. A
+    // substring match on the WHOLE pattern used to throw away VALID IOCs with a WRONG reason —
+    // `[url:value='http://x/likely-bad']` was rejected as "LIKE", `within.example.com` as "WITHIN" —
+    // i.e. exactly the silent detection blind spot this module's header promises to avoid.
+    let up = pattern_structure(p).to_ascii_uppercase();
     for bad in ["FOLLOWEDBY", "REPEATS", "WITHIN", "LIKE", "MATCHES", "ISSUBSET", "ISSUPERSET", " IN ", " IN(", "!=", "<=", ">=", "<", ">"] {
         if up.contains(bad) {
             return Err(format!("unsupported pattern operator/qualifier ({})", bad.trim()));
@@ -189,6 +194,40 @@ pub fn parse_stix_pattern(pattern: &str) -> Result<Vec<(&'static str, String)>, 
         return Err("no comparison found in observation".into());
     }
     Ok(out)
+}
+
+/// Return a same-shape view of `s` in which the CONTENT of every single-quoted STIX string literal is
+/// replaced by spaces (the quotes themselves are kept). Used to scan the pattern's STRUCTURE — object
+/// paths, operators, qualifiers — without ever looking inside a VALUE. `\'` and `\\` inside a literal
+/// do not close it (same escaping as `unquote_stix`). One character in, one character out, so the view
+/// stays readable in errors; it is only used for substring checks, never for byte offsets into `s`.
+fn pattern_structure(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let (mut in_q, mut esc) = (false, false);
+    for c in s.chars() {
+        if !in_q {
+            if c == '\'' {
+                in_q = true;
+            }
+            out.push(c);
+        } else if esc {
+            esc = false;
+            out.push(' ');
+        } else {
+            match c {
+                '\\' => {
+                    esc = true;
+                    out.push(' ');
+                }
+                '\'' => {
+                    in_q = false;
+                    out.push('\'');
+                }
+                _ => out.push(' '),
+            }
+        }
+    }
+    out
 }
 
 /// Split `s` on a case-insensitive separator, but ONLY at bracket/paren depth 0 and outside single
@@ -377,6 +416,42 @@ mod tests {
         assert!(parse_stix_pattern("[a:value = 'x'] FOLLOWEDBY [b:value = 'y']").is_err()); // multi-obs
         assert!(parse_stix_pattern("[domain-name:value = 'a.com' AND url:value = 'http://a']").is_err()); // AND
         assert!(parse_stix_pattern("[ipv4-addr:value != '1.2.3.4']").is_err()); // non-equality
+    }
+
+    // S3 — la denylist d'opérateurs doit porter sur la STRUCTURE du motif, JAMAIS sur le contenu des
+    // valeurs : un IOC valide dont la valeur contient « likely-bad », « within », « matches », «
+    // repeats » ou « < » est courant sur un flux TI public, et le jeter avec un motif faux
+    // (« unsupported operator ») est exactement l'angle mort de détection que l'en-tête du module
+    // promet d'éviter (« never a silent miss »).
+    #[test]
+    fn parse_operator_substring_inside_value_is_not_an_operator() {
+        for (pattern, kind, value) in [
+            ("[url:value='http://x/likely-bad']", "url", "http://x/likely-bad"),
+            ("[domain-name:value='within.example.com']", "domain", "within.example.com"),
+            ("[domain-name:value='matches-evil.example']", "domain", "matches-evil.example"),
+            ("[url:value='http://x/repeats']", "url", "http://x/repeats"),
+            ("[url:value='http://x/?a=1<2']", "url", "http://x/?a=1<2"),
+        ] {
+            let got = parse_stix_pattern(pattern)
+                .unwrap_or_else(|e| panic!("IOC valide rejeté : {pattern} -> {e}"));
+            assert_eq!(got, vec![(kind, value.to_string())], "{pattern}");
+        }
+    }
+
+    #[test]
+    fn parse_operator_in_structure_is_still_rejected() {
+        // Contre-preuve : un VRAI opérateur (hors littéral) reste refusé avec sa raison.
+        for pattern in [
+            "[file:name LIKE '%.exe']",
+            "[file:name MATCHES 'evil']",
+            "[ipv4-addr:value != '1.2.3.4']",
+            "[network-traffic:dst_port > '1024']",
+            "[domain-name:value IN ('a.com','b.com')]",
+            "[a:value = 'x'] REPEATS 3 TIMES",
+            "[a:value = 'x'] WITHIN 60 SECONDS",
+        ] {
+            assert!(parse_stix_pattern(pattern).is_err(), "doit rester refusé : {pattern}");
+        }
     }
 
     #[test]
