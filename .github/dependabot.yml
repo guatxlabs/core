@@ -1,0 +1,24 @@
+# Dependabot — alertes + mises à jour de dépendances (gratuit sur repo public).
+# Épingle les MàJ derrière une PR (jamais un merge auto) → revue humaine, cohérent avec
+# « l'enforcement, pas la confiance ». Couvre : le crate guatx-core (cargo, racine du repo) et les
+# GitHub Actions (garde les SHA-pins de ci.yml à jour).
+version: 2
+updates:
+  # Crate Rust guatx-core (deps de build/runtime) — Cargo.toml à la RACINE du repo.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(cargo)"
+
+  # GitHub Actions — maintient les actions SHA-pinnées de .github/workflows/ à jour
+  # (Dependabot propose le nouveau SHA + le commentaire de version).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(actions)"

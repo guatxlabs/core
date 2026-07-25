@@ -1,0 +1,158 @@
+# Corpus différentiel SOQL — couverture du compilateur (gate de la migration compilo Plume -> core).
+#
+# SOURCE : extraites des SEEDS du daemon Plume (requêtes livrées avec le produit) = ce qui est inséré dans
+#   `rule`/`panel` sur toute instance (panneaux de dashboards is_soql=1 + règles de détection is_soql=1)
+#   + les requêtes purple/blindspot nommées (T1046/T1190/T1595, join mitre, `stats dc(vhost) by src_ip`)
+#   + un bloc de couverture des étages du compilo (rex/eval/append/dedup/top/eventstats/mots réservés).
+# Équivalent READ-ONLY de `SELECT query FROM rule WHERE is_soql=1` + requêtes `panel` is_soql=1. Les
+#   panneaux is_soql=0 (SQL brut `SELECT ... FROM metric`) sont EXCLUS : non compilés par le compilo
+#   soql (compile_panel_sql les rend tels quels).
+# Lignes vides / `#...` ignorées. Une requête soql par ligne.
+
+# --- Dashboard « Vue d'ensemble » (panels is_soql=1) ---
+search | timechart span=1h count
+search | stats count by source | sort -count | head 8
+search severity>=3 | stats count
+
+# --- Dashboard « Sécurité & détection » ---
+search source=vuln | stats count by severity | sort -severity
+search source=clamav | stats count
+search source=conntrack | table ts,message
+search source=auditd | timechart span=1h count
+search source=suricata category=alert | table ts,message
+search source=mail | stats count by category | sort -count
+
+# --- Dashboard « Réseau sortant (egress) » ---
+search source=conntrack dir=outbound scope=external | sort -ts | table dst_host,dst_ip,proc,dport
+search source=conntrack dir=outbound scope=external | stats count by proc | sort -count | head 15
+search source=conntrack dir=outbound scope=external | stats count by dport | sort -count | head 15
+metric net_tx_bps | timechart avg(value)
+
+# --- Dashboard « Trafic web » ---
+search source=web | timechart count
+search source=web scope=external | stats count by src_ip | sort -count | head 20
+search source=web | where severity>=2 | sort -ts | table vhost,path,status,src_ip,ua
+
+# --- Dashboard « Mail — flux & verdicts » ---
+search source=mail verdict=* | timechart count
+search source=mail verdict=* | stats count by sender | sort -count | head 15
+search source=mail verdict=* | stats count by rcpt | sort -count | head 15
+search source=mail | where severity>=3 | sort -ts | table rcpt,sender,verdict,virus,src_ip
+search source=mail action=failure | stats count by src_ip | sort -count | head 15
+
+# --- Dashboard « Accès données » ---
+search source=dataaccess key=app_creds | sort -ts | table user,action,path,comm
+search source=dataaccess | timechart count
+search source=dataaccess | sort -ts | table user,action,path,key,comm
+
+# --- Dashboard « Carte d'accès » ---
+search source=dataacl | where severity>=3 | sort -ts | table path,owner,mode,risk
+search source=dataacl type=d | sort -ts | table path,owner,group,mode
+search source=dataacl | sort -ts | table path,owner,group,mode,flags,risk
+
+# --- Dashboard « RBAC (orchestrateur) » ---
+search source=rbac-audit role=cluster-admin | table subject,kind,binding
+search source=rbac-audit | where severity>=3 | sort -severity | table subject,kind,role,scope,ns,risk
+search source=rbac-audit | sort -ts | table subject,kind,role,scope,ns,risk
+
+# --- Dashboard « Stockage objet » ---
+search source=objstore kind=bucket risk=public | table subject,access
+search source=objstore kind=user | where severity>=2 | sort -severity | table subject,policy,risk,status
+search source=objstore kind=user | table subject,policy,status,risk
+search source=objstore kind=bucket | table subject,access,risk
+search source=objstore kind=store | sort -ts | head 1 | table buckets,objects,versions
+
+# --- Dashboard « Coffre — accès secrets » ---
+search source=svc-audit vtype=response | timechart count
+search source=svc-audit vtype=response | stats count by path | sort -count | head 20
+search source=svc-audit vtype=response | stats count by operation | sort -count
+search source=svc-audit vtype=response | stats count by user | sort -count | head 20
+search source=svc-audit | where error!="" | sort -ts | table user,operation,path,error
+
+# --- Règles (rule WHERE is_soql=1) ---
+metric backup_failed | stats max(value)
+search source=mail category=malware | stats count
+search source=conntrack dir=outbound scope=external | where dport>1024 | stats count
+
+# --- Règles purple ATT&CK ---
+search source=ufw | stats dc(dport) by src_ip | where dc > 15 | stats count
+search source=web status=404 | stats dc(path) by src_ip | where dc > 30 | stats count
+search source=web status>=500 | stats count by src_ip | where count > 10 | stats count
+
+# --- Règles de détection ciblées (portscan / brute-force / Cloudflare / télémétrie) ---
+search source=portscan dir=inbound | stats count
+search category=auth action=failure | stats count by src_ip | where count > 15 | stats count
+search source=cloudflare action=challenged | stats count by src_ip | where count > 20 | stats count
+search source=cloudflare action=blocked cf_source=firewallManaged | stats count by src_ip | where count > 3 | stats count
+search source=cloudflare | stats count by src_ip | where count > 100 | stats count
+search source=cloudflare | stats dc(vhost) by src_ip | where dc > 3 | stats count
+search source=cloudflare action=challenged | stats dc(src_ip)
+search source=objstore-audit bucket=*backups api=~^Delete[BM] | stats count
+search source=objstore-audit bucket=*backups api=Delete* status=AccessDenied | stats count
+search source=auditd category=tamper severity>=4 | stats count
+search source=integrity kind=suid change=modif | stats count
+search source=integrity change=ajout severity>=3 | stats count
+search source=conntrack scope=external dir=outbound proc!=svc-orchestrator proc!=svc-builder proc!=svc-runtime proc!=svc-cli proc!=svc-toolchain | stats count by dst_ip,proc | where count > 10 | stats count
+search source=svc-audit operation=read path=secret* user!=svc-secrets user!=svc-idp | stats count
+
+# --- Playbook (query is_soql=1) ---
+search source=sshd-session severity>=3 | stats count by src_ip | where count > 10
+
+# --- Couverture étages compilo (rex/eval/append/dedup/top/rare/eventstats/join-mitre/mots réservés/CAST) ---
+search source=web | top 5 src_ip
+search source=web | rare 5 status
+search source=auditd | dedup user,action
+search source=web | eval score = severity * 2 | table src_ip,score
+search source=web | eventstats count by src_ip
+search | rex message "user (?<who>[a-z]+)" | table who
+search source=a | stats count by src_ip | append [search source=b | stats count by src_ip]
+search | stats count by group
+search | stats count by order | sort -order
+search verb=5
+search dport=5
+search resource=secrets verb=delete operation=read
+search | stats count by mitre | join mitre [search source=x | stats count by mitre]
+search source=cloudflare | mvexpand ips
+search source=web src_ip=1.2.3.4 | mvexpand tags | stats count by tags
+search | mvexpand src_ip
+
+# --- Agrégats-liste bornés (group_concat_bounded : values/list) — anti-explosion, recon multi-valeur ---
+# (la méthode Dialect group_concat_bounded est désormais couverte par le banc différentiel)
+search source=cloudflare | stats values(user) by src_ip
+search source=web | stats list(vhost) by src_ip
+search | stats values(vhost) by src_ip | sort -src_ip
+
+# --- Filtres `in` / `not in` (pré-pass OP 2) — base ET where — + `not in` sur champ JSON ---
+search user not in (root,ubuntu)
+search dport in (80,443)
+search source=web dport in (80,443,8080) | stats count by src_ip
+search | where dport in (80,443) | stats count
+search | where user not in (root,ubuntu) | stats count by src_ip
+
+# --- Opérateurs SQL espacés (glue) : `champ = "x"` doit se recoller comme `champ=x` ---
+search source = web
+search severity >= 3 | stats count
+
+# --- Métriques AVEC labels (metric_base : filtre label=val ET `by <label>` via json_extract(labels,...)) ---
+# (le chemin label des métriques n'était atteint par AUCUN corpus ni golden avant)
+metric http_requests_total job=api | timechart avg(value)
+metric http_requests_total by code | timechart avg(value)
+metric http_requests_total job=api by code | stats max(value) by code
+
+# --- Termes libres (like_contains) : couverture DIFFÉRENTIELLE (avant : goldens seuls) ---
+search failed password
+search source=sshd invalid user
+
+# --- Panneaux/règles après substitution __OPERATOR_EXCL__/__SELF_EXCL__ (ce que le compilo voit VRAIMENT) ---
+# apply_excl_placeholders injecte des `src_ip!=<ip>` (-> <>) et `src_ip!=<cidr>*` / `vhost!=<host>*` (-> NOT LIKE) AVANT compilation
+search source=web scope=external src_ip!=1.2.3.4 src_ip!=203.0.113.* | stats count by src_ip | sort -count | head 20
+search source=web src_ip!=1.2.3.4 vhost!=app.example.com* | where severity>=2 | sort -ts | table vhost,path,status,src_ip,ua
+
+# --- Enrichissement `rename` (OP 3) : colonne réelle, champ JSON, multi-paires ---
+search source=web | rename src_ip AS client
+search source=web | rename vhost AS host_header, ua AS agent
+search source=web | rename status AS code | stats count by code
+
+# --- Enrichissement `lookup` : branche SANS OUTPUT (val JSON entier) ET branche AVEC OUTPUT ---
+search source=web | lookup geoip src_ip
+search source=web | lookup geoip src_ip OUTPUT country,asn
