@@ -1081,6 +1081,19 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
     if stages.is_empty() {
         return Err("soql vide".into());
     }
+    // S2 (a) — BORNE DU NOMBRE D'ÉTAPES. Rien ne bornait la LONGUEUR du pipeline (`depth > 3` ne borne que
+    // l'imbrication des sous-recherches, `MACRO_MAX_LEN` que l'expansion de macros) : une requête de viewer
+    // pouvait empiler des milliers d'étages, chacun enveloppant le SQL accumulé. Refus EXPLICITE au-delà de
+    // la borne (cf. bandeau BORNES D'EXPLOITATION, `GUATX_SOQL_MAX_STAGES`) — jamais un pipeline tronqué.
+    let max_stages = soql_max_stages()?;
+    if stages.len() as i64 > max_stages {
+        return Err(format!("pipeline trop long : {} étapes (maximum {max_stages})", stages.len()));
+    }
+    // S2 (b) — BORNE DE TAILLE DU SQL ÉMIS, vérifiée APRÈS CHAQUE étape (plus bas). `eventstats
+    // values`/`list` interpole le SQL courant DEUX FOIS par étage -> croissance en 4^k : ~700 caractères de
+    // requête suffisaient à produire des centaines de Mo de SQL (OOM PENDANT LA COMPILATION, donc avant tout
+    // budget d'exécution du store). La borne coupe la croissance avec une erreur claire.
+    let max_sql = soql_max_sql_bytes()?;
     let f0 = stages[0].trim();
 
     // FILTRE ENVIRONNEMENT : propagé aux bases qui portent `env_id` (cf. table_base). None en
@@ -1185,6 +1198,14 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
         };
         sql = ns;
         ocols = no;
+        // S2 (b) — la taille du SQL accumulé est vérifiée ICI, à chaque étage : une étape qui imbrique la
+        // requête plusieurs fois (`eventstats values/list`) est arrêtée dès le franchissement de la borne,
+        // avant que l'étage suivant ne la multiplie encore.
+        if sql.len() as i64 > max_sql {
+            return Err(format!(
+                "requête trop complexe : le SQL généré dépasse {max_sql} octets — réduisez le nombre d'étapes (en particulier `eventstats values`/`list`, qui imbrique la requête)"
+            ));
+        }
     }
     // FIELD FILTERS : caviarde le SAC JSON s'il apparaît dans les colonnes FINALES (search nu / head /
     // sort / where qui ne re-projettent pas) -> aucune clé masquée ne fuit via le blob brut. VIDE -> no-op
