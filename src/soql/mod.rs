@@ -614,9 +614,14 @@ fn metric_base(spec: &str, from: i64, to: i64, row_filter: Option<&RowFilter>, d
             value_cond = Some(format!("value {op} {num}"));
             value_cond_roll = Some(format!("avg {op} {num}"));
         } else if let Some((k, v)) = toks[i].split_once('=') {
-            if soql_ident_ok(k) {
-                conds.push(format!("{}='{}'", d.json_extract("labels", k), d.escape_literal(v)));
+            // S10 — FAIL-CLOSED. Un label non-identifiant faisait DISPARAÎTRE le filtre sans un mot : la
+            // requête renvoyait TOUTES les séries de la métrique au lieu du sous-ensemble demandé (dans un
+            // SIEM : une règle qui ne mesure plus ce qu'elle croit mesurer). On REFUSE, comme `table_conds`
+            // pour un terme non supporté et comme `RowFilter::cond_sql` qui va en `1=0`.
+            if !soql_ident_ok(k) {
+                return Err(format!("metric : label invalide : {k}"));
             }
+            conds.push(format!("{}='{}'", d.json_extract("labels", k), d.escape_literal(v)));
         }
         i += 1;
     }
@@ -633,11 +638,14 @@ fn metric_base(spec: &str, from: i64, to: i64, row_filter: Option<&RowFilter>, d
     let mut selr = "ts,host,avg AS value".to_string();
     let mut ocols: Vec<String> = vec!["ts".into(), "host".into(), "value".into()];
     for l in &bylabels {
-        if soql_ident_ok(l) {
-            sel.push_str(&format!(",{} AS {}", d.json_extract("labels", l), soql_qid(l)));
-            selr.push_str(&format!(",{} AS {}", d.json_extract("labels", l), soql_qid(l)));
-            ocols.push(l.clone());
+        // S10 — FAIL-CLOSED (même défaut que le filtre de label ci-dessus) : un label de `by` non-identifiant
+        // faisait disparaître le GROUPEMENT en silence -> séries agrégées ensemble au lieu d'être séparées.
+        if !soql_ident_ok(l) {
+            return Err(format!("metric : label invalide dans `by` : {l}"));
         }
+        sel.push_str(&format!(",{} AS {}", d.json_extract("labels", l), soql_qid(l)));
+        selr.push_str(&format!(",{} AS {}", d.json_extract("labels", l), soql_qid(l)));
+        ocols.push(l.clone());
     }
     let mut raw_conds = conds.clone();
     let mut roll_conds = conds;
