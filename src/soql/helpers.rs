@@ -12,21 +12,41 @@ use super::*;
 
 /// Découpe un texte en jetons (espaces = séparateurs, sauf entre guillemets `"`). PUBLIC : la
 /// route-rollup de Plume (`try_rollup_route`, qui reste côté daemon à la bascule) en dépend.
+/// Sortie STRICTEMENT identique à l'historique : `soql_tokenize_marked` en est la source unique,
+/// on n'en retire que le marqueur de guillemets.
 pub fn soql_tokenize(s: &str) -> Vec<String> {
-    let (mut out, mut cur, mut inq) = (Vec::new(), String::new(), false);
+    let marked = soql_tokenize_marked(s);
+    marked.into_iter().map(|(t, _)| t).collect()
+}
+
+/// Comme `soql_tokenize`, mais CONSERVE pour chaque jeton s'il a été construit avec des guillemets
+/// (`true` dès qu'un `"` a été consommé pendant sa construction).
+///
+/// POURQUOI : `soql_tokenize` JETTE les guillemets, donc l'aval ne peut plus distinguer
+/// `search "user-agent=curl"` (une PHRASE que l'analyste veut chercher telle quelle) de
+/// `search user-agent=curl` (un nom de champ mal écrit). C'est la cause racine des refus abusifs
+/// mesurés sur des phrases quotées légitimes. Le marqueur sert UNIQUEMENT à EXEMPTER un jeton quoté
+/// de la garde de nom de champ (cf. `table_conds`) : il n'ouvre aucun chemin nouveau et ne change
+/// aucune émission SQL.
+pub(crate) fn soql_tokenize_marked(s: &str) -> Vec<(String, bool)> {
+    let (mut out, mut cur, mut inq, mut quoted) = (Vec::new(), String::new(), false, false);
     for c in s.chars() {
         match c {
-            '"' => inq = !inq,
+            '"' => {
+                inq = !inq;
+                quoted = true;
+            }
             c if c.is_whitespace() && !inq => {
                 if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
+                    out.push((std::mem::take(&mut cur), quoted));
                 }
+                quoted = false;
             }
             c => cur.push(c),
         }
     }
     if !cur.is_empty() {
-        out.push(cur);
+        out.push((cur, quoted));
     }
     out
 }

@@ -1624,3 +1624,82 @@
             format!("{base} WHERE \"message\" = 'user in (a,b)'")
         );
     }
+
+    // --- S11 (suite) : la garde vaut aux TROIS étages, et exempte une phrase QUOTÉE -------------
+    #[test]
+    fn s11_quoted_phrase_is_never_read_as_a_field_name() {
+        // RÉGRESSION MESURÉE sur 4b16822 : la garde refusait 6 phrases d'analyste réalistes, parce que
+        // `soql_tokenize` JETAIT les guillemets — l'aval ne pouvait plus distinguer une PHRASE d'un nom
+        // de champ mal écrit. Chaque golden ci-dessous est le SQL rendu AVANT la garde (relevé par sonde
+        // compilée sur 48035b9) : une phrase quotée doit rendre EXACTEMENT ce SQL, à l'octet près.
+        let ev = Schema::events();
+        let b = "SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event";
+        for (q, want) in [
+            ("search \"user-agent=curl/7.68\"", format!("{b} WHERE message LIKE '%user-agent=curl/7.68%'")),
+            ("search \"content-type=application/json\"", format!("{b} WHERE message LIKE '%content-type=application/json%'")),
+            ("search \"x-forwarded-for=10.0.0.1\"", format!("{b} WHERE message LIKE '%x-forwarded-for=10.0.0.1%'")),
+            ("search \"set-cookie=session\"", format!("{b} WHERE message LIKE '%set-cookie=session%'")),
+            ("search \"rate-limit=exceeded\"", format!("{b} WHERE message LIKE '%rate-limit=exceeded%'")),
+            ("search source=web \"cache-control=no-store\"", format!("{b} WHERE \"source\" = 'web' AND message LIKE '%cache-control=no-store%'")),
+            // Guillemets PARTIELS (`"foo-bar"=1`) : un seul jeton, quoté -> chemin historique lui aussi.
+            ("search \"foo-bar\"=1", format!("{b} WHERE message LIKE '%foo-bar=1%'")),
+        ] {
+            assert_eq!(to_sql(q, 0, 0, &ev).unwrap(), want, "phrase quotée refusée ou réécrite : {q}");
+        }
+    }
+
+    #[test]
+    fn s11_guard_holds_on_all_three_stages() {
+        // La MÊME entrée est analysée par TROIS étages successifs ; la garde doit valoir aux trois,
+        // sinon un espace ou une clause `in` suffit à retomber dans le défaut. Mesuré sur 4b16822 :
+        //   pré-pass `in (...)` : search x-forwarded-for in (1,2) -> filtre MUET sur le champ `for`
+        //   recollage glue      : search foo-bar = 1              -> message LIKE '%foo-bar%' AND LIKE '%=1%'
+        //   boucle d'opérateurs : search foo-bar=1                -> (déjà fermé)
+        for (q, field) in [
+            ("search x-forwarded-for in (1,2)", "x-forwarded-for"),
+            ("search foo-bar = 1", "foo-bar"),
+            ("search src-ip >= 5", "src-ip"),
+            ("search foo-bar=1", "foo-bar"),
+            ("search http.status>=500", "http.status"),
+        ] {
+            match to_sql(q, 0, 0, &Schema::events()) {
+                Ok(sql) => panic!("attendu une erreur pour « {q} », obtenu du SQL : {sql}"),
+                Err(e) => assert!(e.contains(field), "l'erreur doit nommer le champ {field} : {e}"),
+            }
+        }
+        // L'ÉCHAPPATOIRE ANNONCÉE PAR LE MESSAGE D'ERREUR EXISTE VRAIMENT : mettre le terme entre
+        // guillemets le rend à la recherche plein-texte (c'est ce que le message dit de faire).
+        let ev = Schema::events();
+        let b = "SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event";
+        assert_eq!(
+            to_sql("search \"foo-bar=1\"", 0, 0, &ev).unwrap(),
+            format!("{b} WHERE message LIKE '%foo-bar=1%'")
+        );
+        assert_eq!(
+            to_sql("search \"x-forwarded-for in (1,2)\"", 0, 0, &ev).unwrap(),
+            format!("{b} WHERE message LIKE '%x-forwarded-for in (1,2)%'")
+        );
+    }
+
+    #[test]
+    fn s11_glue_of_legitimate_spaced_filters_is_unchanged() {
+        // CONTRE-PREUVE du recollage élargi : les formes espacées LÉGITIMES (corpus, « Opérateurs SQL
+        // espacés (glue) ») rendent le MÊME SQL qu'avant, goldens littéraux.
+        let ev = Schema::events();
+        let b = "SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event";
+        assert_eq!(to_sql("search source = web", 0, 0, &ev).unwrap(), format!("{b} WHERE \"source\" = 'web'"));
+        assert_eq!(
+            to_sql("search source = \"web\"", 0, 0, &ev).unwrap(),
+            format!("{b} WHERE \"source\" = 'web'")
+        );
+        assert_eq!(
+            to_sql("search severity >= 3 | stats count", 0, 0, &ev).unwrap(),
+            format!("SELECT COUNT(*) AS \"count\" FROM ({b} WHERE \"severity\" >= 3)")
+        );
+        // Un terme libre SANS opérateur reste intact, quoté ou non (aucun recollage).
+        assert_eq!(to_sql("search x-forwarded-for", 0, 0, &ev).unwrap(), format!("{b} WHERE message LIKE '%x-forwarded-for%'"));
+        assert_eq!(
+            to_sql("search rate-limit exceeded", 0, 0, &ev).unwrap(),
+            format!("{b} WHERE message LIKE '%rate-limit%' AND message LIKE '%exceeded%'")
+        );
+    }
