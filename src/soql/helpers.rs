@@ -99,6 +99,50 @@ pub(crate) fn soql_agg(tok: &str, cols: &[String], json_field: Option<&str>, d: 
     Err(format!("stats : syntaxe invalide '{tok}' (count | sum(f) | avg(f) | min(f) | max(f) | dc(f) | values(f) | list(f))"))
 }
 
+// ---------------------------------------------------------------------------------------------
+// BORNES D'EXPLOITATION DE LA COMPILATION — le texte de requête est une ENTRÉE NON FIABLE
+// (CONTRIBUTING.md), et la compilation a lieu AVANT tout budget d'exécution du store : elle doit
+// donc porter ses propres bornes. Chacune a un DÉFAUT SÛR et se règle par l'environnement (choix
+// d'exploitation). Au DÉPASSEMENT : une ERREUR CLAIRE est rendue à l'appelant — jamais un panic,
+// jamais une valeur substituée en silence, jamais un buffer illimité.
+//
+//   GUATX_SOQL_MAX_SPAN_SECS  défaut 315360000 (10 ans)  bucket `timechart span=` (secondes)
+//   GUATX_SOQL_MAX_STAGES     défaut 64                  nombre d'étapes de pipe d'un pipeline
+//   GUATX_SOQL_MAX_SQL_BYTES  défaut 1048576 (1 Mio)      taille du SQL émis, vérifiée par étape
+//
+// Une variable PRÉSENTE mais illisible (non numérique, ≤ 0) est une ERREUR de configuration rendue à
+// l'appelant, PAS un retour muet au défaut : une borne que l'opérateur croit avoir posée ne doit
+// jamais être ignorée en silence. Lecture UNE FOIS par processus (mise en cache).
+// ---------------------------------------------------------------------------------------------
+
+fn env_limit(var: &str, default: i64) -> Result<i64, String> {
+    match std::env::var(var) {
+        Err(_) => Ok(default),
+        Ok(v) => match v.trim().parse::<i64>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!("configuration invalide : {var} doit être un entier > 0")),
+        },
+    }
+}
+
+/// Borne haute du bucket `timechart span=` (secondes). Cf. bandeau BORNES D'EXPLOITATION.
+pub(crate) fn soql_max_span_secs() -> Result<i64, String> {
+    static C: std::sync::OnceLock<Result<i64, String>> = std::sync::OnceLock::new();
+    C.get_or_init(|| env_limit("GUATX_SOQL_MAX_SPAN_SECS", 315_360_000)).clone()
+}
+
+/// Borne du nombre d'étapes de pipe d'un pipeline. Cf. bandeau BORNES D'EXPLOITATION.
+pub(crate) fn soql_max_stages() -> Result<i64, String> {
+    static C: std::sync::OnceLock<Result<i64, String>> = std::sync::OnceLock::new();
+    C.get_or_init(|| env_limit("GUATX_SOQL_MAX_STAGES", 64)).clone()
+}
+
+/// Borne de la taille (octets) du SQL émis, vérifiée APRÈS CHAQUE étape. Cf. bandeau ci-dessus.
+pub(crate) fn soql_max_sql_bytes() -> Result<i64, String> {
+    static C: std::sync::OnceLock<Result<i64, String>> = std::sync::OnceLock::new();
+    C.get_or_init(|| env_limit("GUATX_SOQL_MAX_SQL_BYTES", 1_048_576)).clone()
+}
+
 pub(crate) fn soql_dur(s: &str) -> Result<i64, String> {
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (num, unit) = s.split_at(split);
@@ -110,7 +154,18 @@ pub(crate) fn soql_dur(s: &str) -> Result<i64, String> {
         "d" => 86400,
         _ => return Err(format!("unité span inconnue : {unit}")),
     };
-    Ok(n * mult)
+    // S1 — ARITHMÉTIQUE BORNÉE. `n * mult` débordait i64 depuis du texte de requête : PANIC du thread
+    // de compilation (profils avec overflow-checks) ou WRAP NÉGATIF rattrapé par le `if span <= 0` de
+    // `compile_timechart`, qui SUBSTITUAIT alors le bucket auto au bucket DEMANDÉ (la requête ne mesure
+    // plus ce qu'elle croit mesurer). Les deux faces sont fermées ici : erreur claire, jamais de
+    // substitution. Le `<= 0` couvre aussi `span=0` explicite (0 n'est pas un bucket : on refuse au
+    // lieu de retomber en silence sur le bucket automatique ; `timechart` SANS `span=` est inchangé).
+    let max = soql_max_span_secs()?;
+    let secs = n.checked_mul(mult).ok_or_else(|| format!("span hors bornes : {s}"))?;
+    if secs <= 0 || secs > max {
+        return Err(format!("span hors bornes : {s} (attendu entre 1 s et {max} s)"));
+    }
+    Ok(secs)
 }
 
 pub(crate) fn soql_expr_sql(expr: &str, json_field: Option<&str>, cols: &[String], d: &dyn Dialect) -> Result<String, String> {

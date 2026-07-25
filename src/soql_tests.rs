@@ -1454,3 +1454,28 @@
         assert_eq!(on.sql, off.sql, "cursor_id no-op sur Forge (finding sans id réel)");
         assert!(!on.columns.iter().any(|c| c == "id"), "pas d'id sur Forge: {:?}", on.columns);
     }
+
+    // --- S1 : `span=` — ARITHMÉTIQUE BORNÉE (plus de panic, plus de substitution muette) --------
+    #[test]
+    fn s1_span_overflow_is_error_not_panic() {
+        // Mesure du rapport : `span=200000000000000d` -> `n * 86400` déborde i64.
+        // ATTENDU : Err CLAIRE rendue à l'appelant (jamais un panic du thread de compilation, jamais
+        // un wrap négatif rattrapé par `if span <= 0` qui SUBSTITUERAIT le bucket demandé).
+        let e = to_sql("search | timechart span=200000000000000d count", 0, 0, &Schema::events())
+            .expect_err("un span qui déborde doit être une erreur, pas un panic");
+        assert!(e.to_lowercase().contains("span"), "l'erreur doit nommer le span : {e}");
+    }
+
+    #[test]
+    fn s1_span_out_of_range_never_substitutes_silently() {
+        // Un span ÉNORME mais sans débordement i64 (10^12 s ≈ 31 700 ans) : la borne haute doit le
+        // REFUSER explicitement — et surtout ne JAMAIS retomber sur le bucket auto (60s…7j), ce qui
+        // ferait mesurer à la requête autre chose que ce qu'elle demande.
+        let e = to_sql("search | timechart span=1000000000000s count", 0, 0, &Schema::events())
+            .expect_err("un span hors bornes doit être une erreur");
+        assert!(e.to_lowercase().contains("span"), "l'erreur doit nommer le span : {e}");
+        // Contre-preuve : un span légitime compile toujours et pose bien SON bucket.
+        let ok = to_sql("search | timechart span=1h count", 0, 0, &Schema::events()).unwrap();
+        assert!(ok.contains("(ts/3600)*3600"), "bucket 1h attendu : {ok}");
+    }
+
