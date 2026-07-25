@@ -46,12 +46,15 @@ La compilation a lieu **avant** tout budget d'exécution du store : elle porte d
 Chacune a un défaut sûr et se règle par l'environnement. **Au dépassement, une erreur claire est rendue
 à l'appelant** — jamais un panic, jamais une valeur substituée en silence.
 
-| Variable | Défaut | Ce qu'elle borne |
-|---|---|---|
-| `GUATX_SOQL_MAX_SPAN_SECS` | `315360000` (10 ans) | le bucket `timechart span=` (secondes) |
-| `GUATX_SOQL_MAX_STAGES` | `64` | le nombre d'étapes de pipe d'un pipeline |
-| `GUATX_SOQL_MAX_SQL_BYTES` | `1048576` (1 Mio) | la taille du SQL émis, vérifiée après chaque étape |
-| `GUATX_SOQL_MAX_TEXT_BYTES` | `1048576` (1 Mio) | la taille du texte de requête accepté |
+| Variable | Défaut | Plafond | Ce qu'elle borne |
+|---|---|---|---|
+| `GUATX_SOQL_MAX_SPAN_SECS` | `315360000` (10 ans) | `315360000` | le bucket `timechart span=` (secondes) |
+| `GUATX_SOQL_MAX_STAGES` | `64` | `1024` | le nombre d'étapes de pipe d'un pipeline |
+| `GUATX_SOQL_MAX_SQL_BYTES` | `1048576` (1 Mio) | `16777216` | la taille du SQL émis, vérifiée après chaque étape |
+| `GUATX_SOQL_MAX_TEXT_BYTES` | `1048576` (1 Mio) | `16777216` | la taille du texte de requête accepté |
+
+Une borne de sécurité peut être **baissée, pas retirée** : au-dessus du plafond la valeur est refusée
+(la borne du span, dont le plafond vaut le défaut, ne peut donc qu'être baissée).
 
 Portée exacte de la borne de SQL : elle est vérifiée **après** chaque étape émettrice (la base, chaque
 champ calculé, chaque lookup automatique, puis chaque étape de pipe). Le pic **transitoire** d'une
@@ -59,9 +62,14 @@ champ calculé, chaque lookup automatique, puis chaque étape de pipe). Le pic *
 grandeur mesuré du couple : 400 006 octets de texte produisent 4 600 089 octets de SQL (×11,5) — donc
 refus, la borne de SQL étant franchie dès la première étape.
 
-Une variable **présente mais illisible** (non numérique, ≤ 0) est signalée comme une erreur de
-configuration, et non ramenée en silence au défaut : une borne que l'opérateur croit avoir posée ne doit
-jamais être ignorée sans le dire.
+Une variable **présente mais illisible** (non numérique, ≤ 0, au-dessus du plafond) est signalée comme
+une erreur de configuration, et non ramenée en silence au défaut : une borne que l'opérateur croit avoir
+posée ne doit jamais être ignorée sans le dire. Conséquence assumée, à connaître avant de déployer :
+tant que la variable est illisible, **toute requête qui consulte cette borne échoue** (fail-closed), et
+le message le dit — c'est une erreur de configuration *serveur*, pas une erreur de la requête. Seule une
+valeur **valide** est mise en cache (lecture unique par processus) : corriger une variable illisible ne
+demande **pas** de redémarrer le service ; en revanche une valeur valide déjà lue reste figée jusqu'au
+redémarrage.
 
 ## Statut
 - ✅ Compilateur de Plume **promu + généralisé** ici (16 étapes, schéma-générique). Suite complète : 121 tests (141 avec `--features forge`).

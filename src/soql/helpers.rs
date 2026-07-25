@@ -147,44 +147,83 @@ pub(crate) fn soql_agg(tok: &str, cols: &[String], json_field: Option<&str>, d: 
 // borné par elle : c'est la borne du TEXTE d'entrée qui le contient. Mesure du couple : 400 006
 // octets de texte -> 4 600 089 octets de SQL (amplification ×11,5) AVANT refus.
 //
-// Une variable PRÉSENTE mais illisible (non numérique, ≤ 0) est une ERREUR de configuration rendue à
-// l'appelant, PAS un retour muet au défaut : une borne que l'opérateur croit avoir posée ne doit
-// jamais être ignorée en silence. Lecture UNE FOIS par processus (mise en cache).
+// Une variable PRÉSENTE mais illisible (non numérique, ≤ 0, au-dessus du PLAFOND) est une ERREUR de
+// configuration rendue à l'appelant, PAS un retour muet au défaut : une borne que l'opérateur croit
+// avoir posée ne doit jamais être ignorée en silence. Conséquence assumée : tant que la variable est
+// illisible, TOUTE requête qui consulte cette borne échoue (fail-closed), et le message le dit —
+// c'est une erreur de CONFIGURATION SERVEUR, pas une erreur de la requête de l'utilisateur.
+//
+// PLAFOND DE SÛRETÉ : chaque borne a un `hard_max`. Une borne de sécurité doit pouvoir être BAISSÉE,
+// jamais RETIRÉE — sans plafond, `GUATX_SOQL_MAX_SQL_BYTES=99999999999999` (valeur d'apparence
+// plausible, mesurée comme acceptée) désactivait la protection anti-OOM.
+//
+// CACHE : seule une valeur VALIDE est mise en cache (lecture unique par processus). Un refus n'est
+// PAS verrouillé -> corriger la variable ne demande pas de redémarrer le service. Symétriquement, une
+// valeur valide déjà lue reste figée pour la vie du processus.
 // ---------------------------------------------------------------------------------------------
 
-fn env_limit(var: &str, default: i64) -> Result<i64, String> {
-    match std::env::var(var) {
-        Err(_) => Ok(default),
-        Ok(v) => match v.trim().parse::<i64>() {
-            Ok(n) if n > 0 => Ok(n),
-            _ => Err(format!("configuration invalide : {var} doit être un entier > 0")),
+/// Plafonds de sûreté (cf. bandeau) : `(défaut, plafond)`. Le plafond du span vaut son défaut — cette
+/// borne-là ne peut donc qu'être BAISSÉE.
+const LIM_SPAN_SECS: (i64, i64) = (315_360_000, 315_360_000);
+const LIM_STAGES: (i64, i64) = (64, 1_024);
+const LIM_SQL_BYTES: (i64, i64) = (1_048_576, 16_777_216);
+const LIM_TEXT_BYTES: (i64, i64) = (1_048_576, 16_777_216);
+
+/// Analyse d'une borne. FONCTION PURE (la valeur brute est un ARGUMENT, pas une lecture d'environnement)
+/// -> testable in-process, contrairement à la lecture cachée. `raw = None` = variable absente = défaut.
+pub(crate) fn parse_limit(
+    var: &str,
+    raw: Option<&str>,
+    default: i64,
+    hard_max: i64,
+) -> Result<i64, String> {
+    match raw {
+        None => Ok(default),
+        Some(v) => match v.trim().parse::<i64>() {
+            Ok(n) if n > 0 && n <= hard_max => Ok(n),
+            _ => Err(format!(
+                "configuration serveur invalide (ce n'est pas votre requête) : la borne de compilation {var} doit être un entier entre 1 et {hard_max}"
+            )),
         },
     }
 }
 
+/// Lecture d'une borne d'environnement, avec MISE EN CACHE DE LA SEULE VALEUR VALIDE (cf. bandeau).
+fn env_limit(
+    cell: &'static std::sync::OnceLock<i64>,
+    var: &str,
+    lim: (i64, i64),
+) -> Result<i64, String> {
+    if let Some(v) = cell.get() {
+        return Ok(*v);
+    }
+    let v = parse_limit(var, std::env::var(var).ok().as_deref(), lim.0, lim.1)?;
+    let _ = cell.set(v);
+    Ok(v)
+}
+
 /// Borne haute du bucket `timechart span=` (secondes). Cf. bandeau BORNES D'EXPLOITATION.
 pub(crate) fn soql_max_span_secs() -> Result<i64, String> {
-    static C: std::sync::OnceLock<Result<i64, String>> = std::sync::OnceLock::new();
-    C.get_or_init(|| env_limit("GUATX_SOQL_MAX_SPAN_SECS", 315_360_000)).clone()
+    static C: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    env_limit(&C, "GUATX_SOQL_MAX_SPAN_SECS", LIM_SPAN_SECS)
 }
 
 /// Borne du nombre d'étapes de pipe d'un pipeline. Cf. bandeau BORNES D'EXPLOITATION.
 pub(crate) fn soql_max_stages() -> Result<i64, String> {
-    static C: std::sync::OnceLock<Result<i64, String>> = std::sync::OnceLock::new();
-    C.get_or_init(|| env_limit("GUATX_SOQL_MAX_STAGES", 64)).clone()
+    static C: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    env_limit(&C, "GUATX_SOQL_MAX_STAGES", LIM_STAGES)
 }
 
 /// Borne de la taille (octets) du SQL émis, vérifiée APRÈS CHAQUE étape. Cf. bandeau ci-dessus.
 pub(crate) fn soql_max_sql_bytes() -> Result<i64, String> {
-    static C: std::sync::OnceLock<Result<i64, String>> = std::sync::OnceLock::new();
-    C.get_or_init(|| env_limit("GUATX_SOQL_MAX_SQL_BYTES", 1_048_576)).clone()
+    static C: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    env_limit(&C, "GUATX_SOQL_MAX_SQL_BYTES", LIM_SQL_BYTES)
 }
 
 /// Borne de la taille (octets) du TEXTE DE REQUÊTE accepté. Cf. bandeau ci-dessus.
 pub(crate) fn soql_max_text_bytes() -> Result<i64, String> {
-    static C: std::sync::OnceLock<Result<i64, String>> = std::sync::OnceLock::new();
-    C.get_or_init(|| env_limit("GUATX_SOQL_MAX_TEXT_BYTES", 1_048_576))
-        .clone()
+    static C: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    env_limit(&C, "GUATX_SOQL_MAX_TEXT_BYTES", LIM_TEXT_BYTES)
 }
 
 pub(crate) fn soql_dur(s: &str) -> Result<i64, String> {

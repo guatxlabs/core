@@ -1843,3 +1843,74 @@
         assert!(to_sql("search source=svc-audit vtype=response | timechart count", 0, 0, &ev).is_ok());
         assert!(to_sql("metric http_requests_total job=api | timechart avg(value)", 0, 0, &ev).is_ok());
     }
+
+    // --- env_limit : plafond de sûreté, refus non verrouillé, et preuves du câblage -------------
+    #[test]
+    fn env_limit_parsing_is_covered() {
+        // AUCUN test ne couvrait `env_limit` : ni l'override, ni la valeur illisible, ni le plafond.
+        // `parse_limit` est PUR (valeur brute en argument) -> mesurable in-process.
+        let v = "GUATX_SOQL_MAX_SQL_BYTES";
+        assert_eq!(parse_limit(v, None, 1_048_576, 16_777_216), Ok(1_048_576)); // absente -> défaut
+        assert_eq!(parse_limit(v, Some("4096"), 1_048_576, 16_777_216), Ok(4096)); // baissée -> OK
+        assert_eq!(parse_limit(v, Some(" 4096 "), 1_048_576, 16_777_216), Ok(4096)); // trim
+        assert_eq!(parse_limit(v, Some("16777216"), 1_048_576, 16_777_216), Ok(16_777_216)); // plafond exact
+        // PLAFOND DE SÛRETÉ : mesuré AVANT ce correctif, `99999999999999` était ACCEPTÉ — la protection
+        // anti-OOM était donc désactivable par une valeur d'apparence plausible.
+        for bad in ["99999999999999", "16777217", "abc", "0", "-1", "", "1e6"] {
+            let e = parse_limit(v, Some(bad), 1_048_576, 16_777_216)
+                .expect_err("valeur hors bornes ou illisible : {bad}");
+            assert!(e.contains(v) && e.contains("entre 1 et 16777216"), "message inexploitable : {e}");
+            // Le message doit dire à un VIEWER que ce n'est pas sa requête qui est en cause.
+            assert!(e.contains("configuration serveur"), "message non qualifié : {e}");
+        }
+        // La borne du span ne peut qu'être BAISSÉE (plafond = défaut).
+        assert_eq!(parse_limit("GUATX_SOQL_MAX_SPAN_SECS", Some("86400"), 315_360_000, 315_360_000), Ok(86_400));
+        assert!(parse_limit("GUATX_SOQL_MAX_SPAN_SECS", Some("315360001"), 315_360_000, 315_360_000).is_err());
+    }
+
+    #[test]
+    fn env_limit_env_wiring_is_measured() {
+        // Le cache `OnceLock` rend ces chemins INTESTABLES in-process (une seule lecture par processus) :
+        // chaque cas est donc mesuré dans un PROCESSUS FILS dédié — ce même test, relancé avec un rôle.
+        match std::env::var("GUATX_CORE_ENV_LIMIT_PROBE").as_deref() {
+            Ok("override") => {
+                // GUATX_SOQL_MAX_STAGES=2 : l'override est bien pris en compte.
+                to_sql("search | head 1", 0, 0, &Schema::events()).expect("2 étapes <= 2");
+                let e = to_sql("search | head 1 | head 2", 0, 0, &Schema::events()).expect_err("3 étapes > 2");
+                assert!(e.contains("maximum 2"), "{e}");
+            }
+            Ok("ceiling") => {
+                // GUATX_SOQL_MAX_SQL_BYTES=99999999999999 : accepté AVANT le correctif.
+                let e = to_sql("search source=web", 0, 0, &Schema::events()).expect_err("plafond de sûreté");
+                assert!(e.contains("GUATX_SOQL_MAX_SQL_BYTES") && e.contains("16777216"), "{e}");
+            }
+            Ok("unreadable") => {
+                // GUATX_SOQL_MAX_SQL_BYTES=abc : refus… mais NON verrouillé dans le cache.
+                let e = to_sql("search source=web", 0, 0, &Schema::events()).expect_err("valeur illisible");
+                assert!(e.contains("GUATX_SOQL_MAX_SQL_BYTES"), "{e}");
+                std::env::remove_var("GUATX_SOQL_MAX_SQL_BYTES");
+                to_sql("search source=web", 0, 0, &Schema::events()).expect("corrigée -> aucun redémarrage");
+                // …et la valeur VALIDE, elle, est figée pour la vie du processus (lecture unique).
+                std::env::set_var("GUATX_SOQL_MAX_SQL_BYTES", "abc");
+                to_sql("search source=web", 0, 0, &Schema::events()).expect("valeur valide déjà en cache");
+            }
+            _ => {
+                for (role, var, val) in [
+                    ("override", "GUATX_SOQL_MAX_STAGES", "2"),
+                    ("ceiling", "GUATX_SOQL_MAX_SQL_BYTES", "99999999999999"),
+                    ("unreadable", "GUATX_SOQL_MAX_SQL_BYTES", "abc"),
+                ] {
+                    let exe = std::env::current_exe().expect("current_exe");
+                    let out = std::process::Command::new(exe)
+                        .args(["soql::tests::env_limit_env_wiring_is_measured", "--exact", "--nocapture", "--test-threads", "1"])
+                        .env("GUATX_CORE_ENV_LIMIT_PROBE", role)
+                        .env(var, val)
+                        .output()
+                        .expect("processus fils");
+                    let s = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+                    assert!(out.status.success(), "sonde « {role} » en échec :\n{s}");
+                    assert!(s.contains("1 passed"), "sonde « {role} » non exécutée :\n{s}");
+                }
+            }
+        }
+    }
