@@ -607,7 +607,14 @@ fn metric_base(spec: &str, from: i64, to: i64, row_filter: Option<&RowFilter>, d
     let mut i = 2;
     while i < toks.len() {
         if toks[i] == "by" {
-            bylabels = toks[i + 1..].join(" ").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            // S10 — AUCUN LABEL N'EST JETÉ ICI. Le `.filter(|s| !s.is_empty())` qui vivait là faisait
+            // DISPARAÎTRE en silence tout label vide, donc `by` NU (`metric node_load1 by`), `by ,`,
+            // `by ,code`, `by code,,job` — mesurés : le regroupement s'évaporait sans un mot, exactement
+            // le mode d'échec S10. La liste est rendue TELLE QUELLE et c'est la validation `soql_ident_ok`
+            // ci-dessous — le SEUL endroit où un label est accepté ou refusé — qui tranche. `by` nu donne
+            // `"".split(',')` = UN label vide -> refusé lui aussi, pas de cas particulier à écrire.
+            let joined = toks[i + 1..].join(" ");
+            bylabels = joined.split(',').map(|s| s.trim().to_string()).collect();
             break;
         }
         if let Some((op, num)) = parse_value_filter(toks[i]) {
@@ -653,8 +660,9 @@ fn metric_base(spec: &str, from: i64, to: i64, row_filter: Option<&RowFilter>, d
             // Le libellé nomme ce que l'UTILISATEUR a écrit, pas un « label » qu'il n'a jamais écrit :
             // `by` JOINT ses jetons avec un espace avant de couper sur les virgules, donc `by code extra`
             // produisait le pseudo-label « code extra ». On rappelle le séparateur attendu.
+            let shown = if l.is_empty() { "(vide)" } else { l.as_str() };
             return Err(format!(
-                "metric : label invalide dans `by` : « {l} » (les labels de `by` se séparent par des virgules : `by code,job`)"
+                "metric : label invalide dans `by` : « {shown} » (les labels de `by` se séparent par des virgules : `by code,job`)"
             ));
         }
         sel.push_str(&format!(",{} AS {}", d.json_extract("labels", l), soql_qid(l)));
@@ -674,33 +682,36 @@ fn metric_base(spec: &str, from: i64, to: i64, row_filter: Option<&RowFilter>, d
 /// Re-colle un filtre `champ op valeur` éclaté par des espaces (`source = "x"` -> `source="x"`),
 /// pour tolérer la syntaxe SQL habituelle. Fusionne `<ident> <op…>` et tout jeton finissant par un
 /// opérateur (= : ! < > ~) avec le jeton suivant. Un terme libre sans opérateur reste intact.
-/// Chaque jeton porte son marqueur « était quoté » (cf. `soql_tokenize_marked`) ; un jeton FUSIONNÉ
-/// hérite du marqueur de son PREMIER fragment (c'est lui qui porte le nom de champ prétendu).
-fn soql_glue_spaced_ops(tokens: Vec<(String, bool)>) -> Vec<(String, bool)> {
+/// Un jeton FUSIONNÉ garde la quotation de son PREMIER fragment (c'est lui qui porte le nom de champ
+/// prétendu) et couvre les octets source du premier au dernier fragment (`beg`..`end`), de sorte que
+/// le texte que l'utilisateur a réellement tapé — espaces compris — reste récupérable en aval.
+fn soql_glue_spaced_ops(tokens: Vec<SoqlTok>) -> Vec<SoqlTok> {
     fn is_op(c: char) -> bool { matches!(c, '=' | ':' | '!' | '<' | '>' | '~') }
-    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut out: Vec<SoqlTok> = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
-        let (mut t, quoted) = tokens[i].clone();
+        let mut t = tokens[i].clone();
         i += 1;
-        let bare = !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        // `soql_ident_ok` EST le prédicat qui était écrit ici en toutes lettres (`!vide && tout
+        // [A-Za-z0-9_]`) : même fonction, un seul endroit où elle vit désormais.
+        let bare = soql_ident_ok(&t.text);
         // ÉTAGE 2 DE LA GARDE DE NOM DE CHAMP. `bare` (identifiant nu) ne recollait que les noms
         // VALIDES : un nom mal écrit restait éclaté en deux jetons et repartait en DEUX scans
         // plein-texte, contournant la garde de `table_conds` au prix d'un espace. Mesuré avant :
         // `search foo-bar = 1` -> `message LIKE '%foo-bar%' AND message LIKE '%=1%'`.
-        // On recolle donc aussi un nom en FORME de champ (`soql_fieldish`) — mais JAMAIS un jeton
-        // QUOTÉ : entre guillemets, l'analyste écrit une phrase, pas un nom de champ, et son jeton
-        // doit suivre le chemin historique à l'octet près.
-        let gluable = bare || (!quoted && soql_fieldish(&t));
-        if gluable && i < tokens.len() && tokens[i].0.starts_with(is_op) {
-            t.push_str(&tokens[i].0);
+        // On recolle donc aussi un nom en FORME de champ (`soql_fieldish`) — mais JAMAIS un jeton qui
+        // COMMENCE par du texte quoté (`quoted_prefix(1)`) : là, l'analyste ouvre une phrase, pas un
+        // nom de champ, et son jeton doit suivre le chemin historique à l'octet près.
+        let gluable = bare || (!t.quoted_prefix(1) && soql_fieldish(&t.text));
+        if gluable && i < tokens.len() && tokens[i].text.starts_with(is_op) {
+            t.absorb(&tokens[i]);
             i += 1;
         }
-        if t.ends_with(is_op) && i < tokens.len() {
-            t.push_str(&tokens[i].0);
+        if t.text.ends_with(is_op) && i < tokens.len() {
+            t.absorb(&tokens[i]);
             i += 1;
         }
-        out.push((t, quoted));
+        out.push(t);
     }
     out
 }
@@ -710,33 +721,19 @@ fn soql_glue_spaced_ops(tokens: Vec<(String, bool)>) -> Vec<(String, bool)> {
 /// le glue/tokenize via un PRÉ-PASS dédié au niveau STRING (cf. `soql_in_collect`). Bornée : la liste
 /// interne `[^()]*` interdit toute parenthèse imbriquée (motif fini, pas de ReDoS).
 ///
-/// Le groupe 1 capture le nom de champ ENTIER — `.` et `-` inclus (`soql_fieldish`), PAS seulement
-/// `[A-Za-z0-9_]`. Avec l'ancienne classe, `\b` s'ouvrait APRÈS le tiret/point et la capture ne
-/// retenait que le DERNIER segment : `x-forwarded-for in (1,2)` filtrait le champ `for`,
-/// `http.status in (500,502)` le champ `status` — un filtre MUET SUR UN AUTRE CHAMP (pas un scan
-/// plein-texte : un faux négatif silencieux dans une règle de détection). La validité du nom capturé
-/// est tranchée par l'appelant (`soql_in_collect` / `soql_parse_in`), qui REFUSE un nom non
-/// identifiant au lieu de filtrer un champ que l'utilisateur n'a pas nommé.
+/// Le groupe 1 ne décrit PAS le nom par une classe de caractères « autorisés » : il capture tout ce qui
+/// précède `in` JUSQU'À LA FRONTIÈRE RÉELLE d'un jeton (`[^\s(]+` : espace, début de chaîne, ou `(`).
+/// C'est le point clé de sûreté : une classe de caractères se contourne par le caractère suivant —
+/// `[A-Za-z0-9_]` ne retenait que `for` dans `x-forwarded-for`, `[A-Za-z0-9_.-]` ne retenait que `status`
+/// dans `cache/status` ou `host` dans `user@host`, filtrant ainsi un champ que l'utilisateur n'a JAMAIS
+/// nommé (pas un scan plein-texte : un faux négatif silencieux dans une règle de détection). Avec la
+/// frontière, le nom capturé est TOUT le jeton, quel que soit le séparateur employé ; sa validité est
+/// ensuite tranchée par l'appelant (`soql_in_collect` / `soql_parse_in`), qui REFUSE un nom non
+/// identifiant EN LE NOMMANT EN ENTIER. Groupe 2 = `not ` optionnel, groupe 3 = le mot-clé `in`
+/// (sa POSITION sert au test de quotation, cf. `soql_in_collect`), groupe 4 = la liste.
 fn soql_in_re() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"(?i)\b([A-Za-z_][A-Za-z0-9_.\-]*)\s+(not\s+)?in\s*\(([^()]*)\)").unwrap())
-}
-
-/// Nom de champ COMPLET d'une clause `in (...)` : la capture du groupe 1, ÉTENDUE vers la gauche tant
-/// que les caractères restent « forme de nom de champ ». `\b` garantit que le caractère précédent n'est
-/// pas `[A-Za-z0-9_]` — il peut en revanche être `-` ou `.` quand le nom DÉBUTE par un caractère que la
-/// classe de tête n'admet pas (`-foo in (1,2)`). Sans cette extension, un tel nom serait tronqué et le
-/// filtre porterait, là encore, sur un AUTRE champ.
-fn soql_in_full_field(first: &str, field_start: usize, captured: &str) -> String {
-    let lead: String = first[..field_start]
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
-        .collect::<Vec<char>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{lead}{captured}")
+    RE.get_or_init(|| regex::Regex::new(r"(?i)([^\s(]+)\s+(not\s+)?(in)\s*\(([^()]*)\)").unwrap())
 }
 
 /// CORE-1 : TRUE si l'octet `pos` de `s` tombe À L'INTÉRIEUR d'un littéral entre guillemets (nombre de `"`
@@ -772,9 +769,17 @@ fn soql_in_cond(field: &str, negate: bool, vals: &[String], base: &BaseDef, d: &
     Ok(format!("{fexpr}{collate} {} ({list})", if negate { "NOT IN" } else { "IN" }))
 }
 
-/// Message UNIQUE pour un nom de champ MAL ÉCRIT rencontré là où un FILTRE de champ est attendu
-/// (`x-forwarded-for=1`, `http.status in (500)`). Donne l'ÉCHAPPATOIRE, MESURÉ par les tests : mettre le
-/// terme entre guillemets le rend à la recherche plein-texte.
+/// Message UNIQUE des DEUX syntaxes de FILTRE DE BASE : le jeton `champ<op>valeur` de `table_conds`
+/// et la clause `champ in (…)` du pré-pass. Ce sont les deux seuls endroits du filtre de base où un
+/// nom de champ est accepté ou refusé, et ils partagent donc ce message. PORTÉE EXACTE : l'étape
+/// `where` a sa PROPRE validation et son propre libellé (`where : champ invalide : …`, cf.
+/// `stages.rs`) — elle n'est pas concernée par cette fonction.
+///
+/// `term` DOIT être le texte SOURCE que l'utilisateur a tapé pour ce filtre, guillemets retirés
+/// (`SoqlTok::source_unquoted` côté jeton, la portée du match côté `in`) : l'échappatoire suggérée est
+/// alors du texte qu'il reconnaît. Que `search "<term>"` rende bien une recherche plein-texte SUR CE
+/// TEXTE est MESURÉ, sur les formes de `s11_error_suggestion_is_the_users_own_text` (jeton collé,
+/// jeton espacé, valeur quotée, clause `in`, guillemets internes).
 fn soql_bad_field_msg(field: &str, term: &str) -> String {
     format!(
         "champ invalide dans le filtre : {field} (un nom de champ n'accepte que lettres, chiffres et « _ » ; pour chercher ce texte tel quel, mettez-le entre guillemets : \"{term}\")"
@@ -790,26 +795,31 @@ fn soql_in_collect(first: &str, base: &BaseDef, conds: &mut Vec<String>, d: &dyn
     let mut err: Option<String> = None;
     let out = soql_in_re().replace_all(first, |caps: &regex::Captures| {
         if err.is_some() { return String::from(" "); }
-        // CORE-1 : le pré-pass court AVANT le tokenize/quote-handling. Si l'IDENTIFIANT capturé (grp 1)
-        // débute À L'INTÉRIEUR d'un littéral quoté, ce n'est PAS une vraie clause `in` : c'est le SUBSTRING
-        // `<x> in (…)` d'une VALEUR quotée (ex. `message="user in (a,b)"`). On laisse le span INTACT -> le
-        // tokenizer le traitera comme l'égalité `message = 'user in (a,b)'`. La borne `in`/`(`/`)` reste alors
-        // au niveau quote 0 (aucun guillemet entre `field` et `(` : `\s+(not\s+)?in\s*\(` n'admet que blancs),
-        // donc un vrai `foo in (a,b,c)` — même avec des VALEURS quotées `("a","b")` — matche toujours.
-        let field_start = caps.get(1).map(|m| m.start()).unwrap_or(0);
-        if soql_pos_quoted(first, field_start) {
+        // CORE-1 : le pré-pass court AVANT le tokenize/quote-handling. Une clause `in` n'est RÉELLE que si
+        // SES DEUX BOUTS — le début du nom (grp 1) ET le mot-clé `in` (grp 3) — sont au niveau quote 0.
+        // Les deux tests sont nécessaires, chacun couvre un cas mesuré que l'autre laisse passer :
+        //  - `message="user in (a,b)"` : le nom capturé commence hors quotes (`message="user`) mais le
+        //    mot-clé `in` est DANS le littéral -> pas une clause, on laisse le span intact et le tokenizer
+        //    en fait l'égalité `message = 'user in (a,b)'`.
+        //  - `"abc def" in (1,2)` : le mot-clé `in` est hors quotes mais le nom (`def"`) commence DANS le
+        //    littéral -> pas une clause non plus : c'est une PHRASE quotée suivie d'un texte libre.
+        // Un vrai `foo in (a,b,c)` — même avec des VALEURS quotées `("a","b")` — a ses deux bouts au
+        // niveau 0 et matche donc toujours.
+        let name_start = caps.get(1).map(|m| m.start()).unwrap_or(0);
+        let in_start = caps.get(3).map(|m| m.start()).unwrap_or(0);
+        if soql_pos_quoted(first, name_start) || soql_pos_quoted(first, in_start) {
             return caps[0].to_string(); // span verbatim : pas une clause `in`
         }
-        // NOM DE CHAMP COMPLET, sinon REFUS. Le groupe 1 capture désormais `.`/`-` (cf. `soql_in_re`) :
-        // un nom mal écrit (`x-forwarded-for`, `http.status`) est REFUSÉ explicitement au lieu d'être
-        // tronqué en un filtre muet sur son dernier segment (`for`, `status`).
-        let field = soql_in_full_field(first, field_start, &caps[1]);
-        if !soql_ident_ok(&field) {
-            err = Some(soql_bad_field_msg(&field, &caps[0]));
+        // NOM DE CHAMP ENTIER, sinon REFUS. Le groupe 1 s'étend jusqu'à la frontière de jeton (cf.
+        // `soql_in_re`) : un nom mal écrit est refusé EN ENTIER (`cache/status`, `user@host`,
+        // `x-forwarded-for`) au lieu d'être tronqué en un filtre muet sur son dernier segment.
+        let field = &caps[1];
+        if !soql_ident_ok(field) {
+            err = Some(soql_bad_field_msg(field, &caps[0].replace('"', "")));
             return String::from(" ");
         }
         let negate = caps.get(2).is_some();
-        let vals = soql_in_values(&caps[3]);
+        let vals = soql_in_values(&caps[4]);
         if vals.is_empty() {
             // CORE-4 : liste VIDE (`in ()` / `in (,,)`). SQLite refuse `x IN ()` (erreur de parse) -> on ne
             // peut pas l'émettre littéralement. Une liste vide = ensemble d'appartenance vide : `in` -> FAUX
@@ -817,7 +827,7 @@ fn soql_in_collect(first: &str, base: &BaseDef, conds: &mut Vec<String>, d: &dyn
             conds.push(if negate { "1=1".to_string() } else { "1=0".to_string() });
             return String::from(" ");
         }
-        match soql_in_cond(&field, negate, &vals, base, d) {
+        match soql_in_cond(field, negate, &vals, base, d) {
             Ok(c) => conds.push(c),
             Err(e) => err = Some(e),
         }
@@ -837,7 +847,7 @@ fn soql_parse_in(expr: &str) -> Option<(String, bool, Vec<String>)> {
     let caps = soql_in_re().captures(e)?;
     let m = caps.get(0)?;
     if m.start() != 0 || m.end() != e.len() { return None; } // match partiel -> pas une clause `in` pure
-    let vals = soql_in_values(caps.get(3)?.as_str());
+    let vals = soql_in_values(caps.get(4)?.as_str());
     if vals.is_empty() { return None; }
     Some((caps.get(1)?.as_str().to_string(), caps.get(2).is_some(), vals))
 }
@@ -859,10 +869,10 @@ fn table_conds(first: &str, base: &BaseDef, d: &dyn Dialect, ko_depth: u32) -> R
     } else {
         first
     };
-    for (tk, quoted) in soql_glue_spaced_ops(soql_tokenize_marked(first)) {
+    for tk in soql_glue_spaced_ops(soql_tokenize_marked(first)) {
         // KNOWLEDGE OBJECTS : `eventtype=NOM` / `tag=LABEL` DÉTENDUS ici (précèdent field=value). Scope
         // KO sans eventtype/tag -> `None` -> jeton traité normalement (mode 0 byte-identique).
-        if let Some(cond) = ko_special_token(&tk, base, d, ko_depth)? {
+        if let Some(cond) = ko_special_token(&tk.text, base, d, ko_depth)? {
             conds.push(cond);
             continue;
         }
@@ -870,26 +880,33 @@ fn table_conds(first: &str, base: &BaseDef, d: &dyn Dialect, ko_depth: u32) -> R
         // et NON un terme libre `message LIKE '%*%'` (scan plein-texte lent qui ne matchait QUE les events
         // contenant littéralement « * »). N'affecte PAS les globs de valeur `champ=val*` (interceptés plus
         // haut par le branch `val.contains('*')`) ni un `*` quoté. Identité dans un AND (`search * source=x`).
-        if tk == "*" {
+        if tk.text == "*" {
             continue;
         }
         let mut matched = false;
         for op in ["=~", ">=", "<=", "!=", "=", ":", ">", "<"] {
-            if let Some(pos) = tk.find(op) {
-                let field = &tk[..pos];
-                let val = &tk[pos + op.len()..];
+            if let Some(pos) = tk.text.find(op) {
+                let field = &tk.text[..pos];
+                let val = &tk.text[pos + op.len()..];
                 // ÉTAGE 3 DE LA GARDE DE NOM DE CHAMP — FAIL-CLOSED. Un jeton NON QUOTÉ qui PRÉTEND
                 // nommer un champ (partie gauche en FORME d'identifiant : `x-forwarded-for`,
                 // `http.status`) mais dont le nom n'est pas un identifiant valide tombait dans la
                 // branche terme-libre : `message LIKE '%foo-bar=1%'` -> scan plein-texte NON BORNÉ à la
                 // place d'un filtre indexé, et surtout un JEU DE LIGNES DIFFÉRENT de celui demandé
                 // (faux négatif MUET dans une règle de détection). On refuse explicitement.
-                // EXEMPTION MESURÉE : un jeton QUOTÉ est une PHRASE, pas un nom de champ — l'analyste a
-                // écrit `search "user-agent=curl/7.68"`. Sans le marqueur de `soql_tokenize_marked`, la
-                // garde refusait ces phrases (6 formes réalistes mesurées) : c'était une régression, pas
-                // une protection. Quoté -> chemin LIKE historique, à l'octet près.
-                if !quoted && !soql_ident_ok(field) && soql_fieldish(field) {
-                    return Err(soql_bad_field_msg(field, &tk));
+                // EXEMPTION MESURÉE : une PHRASE quotée n'est pas un nom de champ — l'analyste a écrit
+                // `search "user-agent=curl/7.68"`. Sans cette exemption, la garde refusait ces phrases
+                // (6 formes réalistes mesurées) : c'était une régression, pas une protection. L'exemption
+                // se demande à `quoted_prefix(pos)`, DONC sur la PARTIE GAUCHE de l'opérateur et non sur le
+                // jeton : guillemeter la seule VALEUR (`x-forwarded-for="10.0.0.1"`) n'exempte rien, car
+                // rien de la partie gauche ne vient des guillemets. Exempté -> chemin LIKE historique.
+                // `field.trim()` : dans TOUT le langage, un nom est délimité par des blancs — un blanc
+                // n'appartient jamais au nom. Un blanc ne peut se retrouver DANS un jeton qu'en venant de
+                // guillemets ; s'ils sont CLOS, `quoted_prefix` a déjà exempté, s'ils ne le sont pas
+                // (`foo-bar" = 1`, mesuré) le nom réclamé reste `foo-bar` et la garde doit le voir.
+                let claimed = field.trim();
+                if !tk.quoted_prefix(pos) && !soql_ident_ok(field) && soql_fieldish(claimed) {
+                    return Err(soql_bad_field_msg(claimed, &tk.source_unquoted(first)));
                 }
                 if soql_ident_ok(field) {
                     let fstr = soql_filter_field(field, false, base, d)?; // FIELD FILTERS : rejet si champ masqué (oracle)
@@ -922,8 +939,8 @@ fn table_conds(first: &str, base: &BaseDef, d: &dyn Dialect, ko_depth: u32) -> R
                 Some(col) if mask_for(col).is_some() => {
                     return Err(format!("recherche plein-texte interdite : le champ « {col} » est masqué pour votre rôle"));
                 }
-                Some(col) => conds.push(d.like_contains(col, &d.escape_literal(&tk))),
-                None => return Err(format!("terme libre non supporté ici : '{tk}'")),
+                Some(col) => conds.push(d.like_contains(col, &d.escape_literal(&tk.text))),
+                None => return Err(format!("terme libre non supporté ici : '{}'", tk.text)),
             }
         }
     }
