@@ -163,10 +163,23 @@ pub fn parse_stix_pattern(pattern: &str) -> Result<Vec<(&'static str, String)>, 
         return Err("unterminated string literal in pattern".into());
     }
     // Reject qualifiers / multi-observation operators outright (case-insensitive check).
+    // A NAMED operator is matched as a TOKEN of the structure, not as a substring: a STIX 2.1 type
+    // name may legally contain one (`x-within-obj`, `x-in-house`), and a substring test refused such
+    // a pattern naming an operator its author never wrote. What separates a real named operator from
+    // its object path — whitespace, bracket, paren, quote — is never a name character, so the forms
+    // covered by `parse_real_operator_token_is_still_rejected` (spaced, doubled, tab/newline, glued
+    // to `]` or `(`, lower-case) stay rejected. This list is the one inherited from the original
+    // denylist; it is NOT a complete inventory of STIX 2.1 qualifiers.
     let up = structure.to_ascii_uppercase();
-    for bad in ["FOLLOWEDBY", "REPEATS", "WITHIN", "LIKE", "MATCHES", "ISSUBSET", "ISSUPERSET", " IN ", " IN(", "!=", "<=", ">=", "<", ">"] {
+    for bad in ["FOLLOWEDBY", "REPEATS", "WITHIN", "LIKE", "MATCHES", "ISSUBSET", "ISSUPERSET", "IN"] {
+        if contains_token(&up, bad) {
+            return Err(format!("unsupported pattern operator/qualifier ({bad})"));
+        }
+    }
+    // Symbolic comparison operators are punctuation: no identifier can contain one, so no token rule.
+    for bad in ["!=", "<=", ">=", "<", ">"] {
         if up.contains(bad) {
-            return Err(format!("unsupported pattern operator/qualifier ({})", bad.trim()));
+            return Err(format!("unsupported pattern operator/qualifier ({bad})"));
         }
     }
     // Single observation only: must be exactly one [...] group. Extract the innermost content.
@@ -203,6 +216,34 @@ pub fn parse_stix_pattern(pattern: &str) -> Result<Vec<(&'static str, String)>, 
         return Err("no comparison found in observation".into());
     }
     Ok(out)
+}
+
+/// Characters that can be part of a STIX object path or type name (`x-my-type:value`,
+/// `file:hashes.MD5`). Used to tell a named operator apart from a name that merely CONTAINS one.
+fn is_stix_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')
+}
+
+/// True if `needle` occurs in `hay` as a whole TOKEN — not glued to a longer STIX name on either
+/// side. Both must already be uppercase; `needle` must be non-empty ASCII.
+fn contains_token(hay: &str, needle: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(needle) {
+        let at = from + rel;
+        let left_free = hay[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_stix_name_char(c));
+        let right_free = hay[at + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_stix_name_char(c));
+        if left_free && right_free {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
 }
 
 /// Return a same-shape view of `s` in which the CONTENT of every single-quoted STIX string literal is
@@ -545,6 +586,74 @@ mod tests {
             let got = parse_stix_pattern(pattern)
                 .unwrap_or_else(|e| panic!("IOC valide rejeté : {pattern} -> {e}"));
             assert_eq!(got, vec![(kind, value.to_string())], "{pattern}");
+        }
+    }
+
+    // Un motif REFUSÉ doit l'être avec la VRAIE raison : une raison fausse envoie l'analyste
+    // chercher un opérateur qu'il n'a jamais écrit.
+    #[test]
+    fn parse_rejection_gives_the_true_reason() {
+        for (pattern, expected) in [
+            // type d'objet custom `x-...` : LÉGAL en STIX 2.1, simplement non traduit ici. La raison
+            // est le chemin d'objet, PAS le qualificateur WITHIN.
+            (
+                "[x-within-obj:value='1.2.3.4']",
+                "unsupported STIX object path",
+            ),
+            (
+                "[x-in-house:value='1.2.3.4']",
+                "unsupported STIX object path",
+            ),
+            // valeur en DOUBLE quotes : la vraie raison est le littéral, pas l'opérateur LIKE.
+            (
+                "[url:value=\"http://x/likely-bad\"]",
+                "not a quoted string literal",
+            ),
+            // algorithme de hachage dont le nom contient un opérateur : raison = algorithme.
+            (
+                "[file:hashes.WITHIN256 = 'dead']",
+                "unsupported hash algorithm",
+            ),
+        ] {
+            let e = parse_stix_pattern(pattern).unwrap_err();
+            assert!(
+                e.contains(expected),
+                "raison trompeuse pour {pattern} : {e}"
+            );
+        }
+    }
+
+    // Direction INVERSE : un VRAI opérateur/qualificateur, hors littéral, reste refusé — y compris
+    // collé à un crochet ou à une parenthèse, où la règle de jeton doit encore mordre.
+    #[test]
+    fn parse_real_operator_token_is_still_rejected() {
+        for (pattern, needle) in [
+            ("[a:value='x']WITHIN 60 SECONDS", "WITHIN"),
+            ("[a:value='x'](WITHIN 60 SECONDS)", "WITHIN"),
+            ("[a:value='x']REPEATS 3 TIMES", "REPEATS"),
+            ("[a:value='x']FOLLOWEDBY [b:value='y']", "FOLLOWEDBY"),
+            ("[file:name  LIKE  '%.exe']", "LIKE"),
+            ("[file:name\tLIKE\t'%.exe']", "LIKE"),
+            ("[file:name\nLIKE\n'%.exe']", "LIKE"),
+            ("[file:name like '%.exe']", "LIKE"),
+            ("[url:value LIKE'x']", "LIKE"),
+            ("[domain-name:value IN('a.com','b.com')]", "IN"),
+            ("[domain-name:value in ('a.com')]", "IN"),
+            ("[domain-name:value NOT IN ('a.com')]", "IN"),
+            ("[domain-name:value ISSUBSET 'a.com']", "ISSUBSET"),
+            ("[domain-name:value ISSUPERSET 'a.com']", "ISSUPERSET"),
+            ("[file:name MATCHES 'evil']", "MATCHES"),
+            ("[ipv4-addr:value!='1.2.3.4']", "!="),
+            ("[network-traffic:dst_port>='1024']", ">="),
+        ] {
+            let e = match parse_stix_pattern(pattern) {
+                Err(e) => e,
+                Ok(ok) => panic!("doit rester refusé : {pattern} -> {ok:?}"),
+            };
+            assert!(
+                e.contains(needle),
+                "raison attendue {needle} pour {pattern} : {e}"
+            );
         }
     }
 
