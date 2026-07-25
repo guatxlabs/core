@@ -135,11 +135,17 @@ pub(crate) fn soql_agg(tok: &str, cols: &[String], json_field: Option<&str>, d: 
 // (CONTRIBUTING.md), et la compilation a lieu AVANT tout budget d'exécution du store : elle doit
 // donc porter ses propres bornes. Chacune a un DÉFAUT SÛR et se règle par l'environnement (choix
 // d'exploitation). Au DÉPASSEMENT : une ERREUR CLAIRE est rendue à l'appelant — jamais un panic,
-// jamais une valeur substituée en silence, jamais un buffer illimité.
+// jamais une valeur substituée en silence.
 //
 //   GUATX_SOQL_MAX_SPAN_SECS  défaut 315360000 (10 ans)  bucket `timechart span=` (secondes)
 //   GUATX_SOQL_MAX_STAGES     défaut 64                  nombre d'étapes de pipe d'un pipeline
-//   GUATX_SOQL_MAX_SQL_BYTES  défaut 1048576 (1 Mio)      taille du SQL émis, vérifiée par étape
+//   GUATX_SOQL_MAX_SQL_BYTES  défaut 1048576 (1 Mio)      taille du SQL émis, vérifiée APRÈS chaque étape
+//   GUATX_SOQL_MAX_TEXT_BYTES défaut 1048576 (1 Mio)      taille du TEXTE de requête accepté
+//
+// PORTÉE EXACTE de la borne de SQL : elle est vérifiée APRÈS chaque étape (base, champs calculés,
+// lookups automatiques, puis chaque étape de pipe). Le pic TRANSITOIRE d'UNE étape n'est donc pas
+// borné par elle : c'est la borne du TEXTE d'entrée qui le contient. Mesure du couple : 400 006
+// octets de texte -> 4 600 089 octets de SQL (amplification ×11,5) AVANT refus.
 //
 // Une variable PRÉSENTE mais illisible (non numérique, ≤ 0) est une ERREUR de configuration rendue à
 // l'appelant, PAS un retour muet au défaut : une borne que l'opérateur croit avoir posée ne doit
@@ -172,6 +178,13 @@ pub(crate) fn soql_max_stages() -> Result<i64, String> {
 pub(crate) fn soql_max_sql_bytes() -> Result<i64, String> {
     static C: std::sync::OnceLock<Result<i64, String>> = std::sync::OnceLock::new();
     C.get_or_init(|| env_limit("GUATX_SOQL_MAX_SQL_BYTES", 1_048_576)).clone()
+}
+
+/// Borne de la taille (octets) du TEXTE DE REQUÊTE accepté. Cf. bandeau ci-dessus.
+pub(crate) fn soql_max_text_bytes() -> Result<i64, String> {
+    static C: std::sync::OnceLock<Result<i64, String>> = std::sync::OnceLock::new();
+    C.get_or_init(|| env_limit("GUATX_SOQL_MAX_TEXT_BYTES", 1_048_576))
+        .clone()
 }
 
 pub(crate) fn soql_dur(s: &str) -> Result<i64, String> {

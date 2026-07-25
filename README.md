@@ -44,13 +44,20 @@ cargo test --all-features    # 150 tests (+ modules `ai` et `cold_tier`)
 ### Bornes de compilation (le texte de requête est une entrée NON FIABLE)
 La compilation a lieu **avant** tout budget d'exécution du store : elle porte donc ses propres bornes.
 Chacune a un défaut sûr et se règle par l'environnement. **Au dépassement, une erreur claire est rendue
-à l'appelant** — jamais un panic, jamais une valeur substituée en silence, jamais un buffer illimité.
+à l'appelant** — jamais un panic, jamais une valeur substituée en silence.
 
 | Variable | Défaut | Ce qu'elle borne |
 |---|---|---|
 | `GUATX_SOQL_MAX_SPAN_SECS` | `315360000` (10 ans) | le bucket `timechart span=` (secondes) |
 | `GUATX_SOQL_MAX_STAGES` | `64` | le nombre d'étapes de pipe d'un pipeline |
 | `GUATX_SOQL_MAX_SQL_BYTES` | `1048576` (1 Mio) | la taille du SQL émis, vérifiée après chaque étape |
+| `GUATX_SOQL_MAX_TEXT_BYTES` | `1048576` (1 Mio) | la taille du texte de requête accepté |
+
+Portée exacte de la borne de SQL : elle est vérifiée **après** chaque étape émettrice (la base, chaque
+champ calculé, chaque lookup automatique, puis chaque étape de pipe). Le pic **transitoire** d'une
+étape n'est donc pas borné par elle : c'est la borne du **texte d'entrée** qui le contient. Ordre de
+grandeur mesuré du couple : 400 006 octets de texte produisent 4 600 089 octets de SQL (×11,5) — donc
+refus, la borne de SQL étant franchie dès la première étape.
 
 Une variable **présente mais illisible** (non numérique, ≤ 0) est signalée comme une erreur de
 configuration, et non ramenée en silence au défaut : une borne que l'opérateur croit avoir posée ne doit
