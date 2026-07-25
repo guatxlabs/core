@@ -1,0 +1,48 @@
+[package]
+name = "guatx-core"
+# Le manifeste suit le TAG de release : bumper ici à chaque release et taguer le commit correspondant,
+# pour qu'un consommateur en dépendance git résolve bien la version qu'annonce le tag.
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.96"           # = la toolchain épinglée par la CI ; exprimée ici pour que `cargo` la vérifie.
+license = "LGPL-3.0-or-later"   # SPDX. `-or-later` = lecture conventionnelle « v3 » ; passer à
+                                # `LGPL-3.0-only` si l'on veut figer la version (changement d'une ligne).
+repository = "https://github.com/guatxlabs/core"
+readme = "README.md"
+description = "Cœur partagé GuatX (Plume ↔ Forge) — le ~70 % commun extrait de la colonne Plume. v0 : moteur soql + SPI store/secret, dépendances minimales (regex, serde_json, secrecy, zeroize). À étendre (auth/host-guard, exécution read-only) au fil de la stabilisation."
+
+[lib]
+name = "guatx_core"
+path = "src/lib.rs"
+
+[features]
+# `forge` — code SPÉCIFIQUE au produit Forge (rouge) isolé du cœur. DÉFAUT OFF : Plume (et un
+# Plume open-source) compile SANS lui -> le compilateur SOQL partagé reste UNIQUE (pas de fork),
+# seul le schéma Forge (`Schema::forge()`, colonne `engagement_id`) et ses tests sont retirés du
+# build Plume. Le MÉCANISME générique de row-scoping (`RowFilter`/`with_row_filter`) reste TOUJOURS
+# disponible aux deux (réutilisable pour le scoping tenant Plume). Forge active ce flag via sa dep :
+# `guatx-core = { path = "...", features = ["forge"] }`. NE PAS mettre dans `default`.
+default = []
+forge = []
+# COLD tier PARQUET (Phase 1) — OFF par défaut. Gate la SEULE variante additive `StoreHandle::Parquet`
+# (coordonnée du writer Parquet côté daemon, type-effacée `&dyn Any` — AUCUNE dép `parquet` ne remonte au
+# cœur). Sans la feature, la variante ET ses bras de match n'existent PAS -> build/tests cœur DÉFAUT
+# byte-identiques. Activée transitivement par la feature `cold_tier` du daemon (`guatx-core/cold_tier`).
+cold_tier = []
+# IA CONSEIL (advisory) — NL→SOQL, OFF par défaut. Gate le module `ai` (SPI `AiProvider` +
+# pipeline NL→SOQL, PUR `std`, ZÉRO dép nouvelle). Sans la feature, `mod ai` n'existe PAS -> build/tests
+# cœur DÉFAUT byte-identiques (mode-0). Le daemon Plume active la couche (impls réseau/vendeur) via
+# `guatx-core/ai` ; le cœur ne porte QUE le contrat + helpers purs (rédaction, prompt, compilo-couture).
+ai = []
+
+[dependencies]
+regex = "1"   # utilisé par l'étape soql `rex` (extraction de groupes nommés) ; sert AUSSI au
+              # banc différentiel (tests/plume_parity.rs) — une dep normale est déjà visible des
+              # tests, d'où la SUPPRESSION de la dev-dependency `regex` redondante.
+serde_json = "1"   # DTO de lecture `store::Rows` (`Vec<Vec<Value>>` + `from_query_json`).
+                   # Couplage serde_json UNIQUEMENT (aucun rusqlite : le trait/impl restent au daemon).
+# SECRET-PROVIDER SPI (Phase 2) : `secret::SecretValue` enveloppe `secrecy::SecretString` (Debug rédigé,
+# zéroïsé au drop via `zeroize`). Les DEUX sont DÉJÀ dans l'arbre du daemon (secrecy 0.10 / zeroize 1.9,
+# tirés transitivement par `age`) -> promus en deps DIRECTES ici, AUCUNE crate native/compilée nouvelle.
+secrecy = "0.10"
+zeroize = "1"

@@ -1,0 +1,299 @@
+//! Helpers d'émission SOQL (schéma-indépendants — portés verbatim de Plume).
+//!
+//! Extrait mécaniquement de `soql.rs` (découpage en sous-modules) : PUR DÉPLACEMENT, aucune
+//! ligne de logique/SQL modifiée — seules des visibilités privées ont été relevées à `pub(crate)`
+//! pour rester joignables depuis le module parent. Comportement byte-identique (cf. `tests/plume_parity.rs`).
+
+use super::*;
+
+// ---------------------------------------------------------------------------------------------
+// Helpers (schéma-indépendants — portés verbatim de Plume).
+// ---------------------------------------------------------------------------------------------
+
+/// Découpe un texte en jetons (espaces = séparateurs, sauf entre guillemets `"`). PUBLIC : la
+/// route-rollup de Plume (`try_rollup_route`, qui reste côté daemon à la bascule) en dépend.
+pub fn soql_tokenize(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut inq) = (Vec::new(), String::new(), false);
+    for c in s.chars() {
+        match c {
+            '"' => inq = !inq,
+            c if c.is_whitespace() && !inq => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+pub(crate) fn soql_ident_ok(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Échappe une valeur pour un littéral chaîne SQL (doublage des `'`). PUBLIC (cf. `soql_tokenize`).
+pub fn soql_esc(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Quoting d'identifiant style SQLite : double-quote + doublage des `"` internes. PORTÉ DE PLUME
+/// (DIVERGENCE 2). Indispensable pour les alias/identifiants GÉNÉRÉS (`AS X`, `GROUP BY X`,
+/// `ORDER BY X`, `USING(X)`) : `soql_ident_ok` autorise des MOTS RÉSERVÉS SQLite (`order`, `group`,
+/// `where`, `from`, `select`...) qui, en position d'identifiant NU, déclenchent `near "X": syntax
+/// error`. Les noms passent déjà `soql_ident_ok` (pas de `"` réel) ; le doublage reste correct par
+/// sécurité. PUBLIC : la route-rollup de Plume en dépend à la bascule.
+pub fn soql_qid(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+pub(crate) fn soql_num(s: &str) -> bool {
+    let s = s.strip_prefix('-').unwrap_or(s);
+    let mut parts = s.split('.');
+    let int = parts.next().unwrap_or("");
+    let frac = parts.next();
+    parts.next().is_none()
+        && !int.is_empty() && int.bytes().all(|b| b.is_ascii_digit())
+        && frac.map_or(true, |f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// count | count(f) | sum(f) | avg(f) | min(f) | max(f) | dc(f)  -> (expr SQL, alias).
+/// DIVERGENCE 1 (parité Plume) : la réf de champ agrégée passe par `soql_field` -> un champ JSON
+/// devient `COUNT(json_extract(fields,'$.X'))` / `COUNT(DISTINCT json_extract(...))` et NON `COUNT(X)`
+/// nu (colonne inexistante -> erreur SQL -> `eval_value=0` -> RÈGLE MUETTE). Rend `stats dc(vhost)
+/// by src_ip` fonctionnel (recon multi-vhost, T1595). Une colonne réelle / un alias de stage est
+/// quoté via `soql_field` (gère les mots réservés).
+pub(crate) fn soql_agg(tok: &str, cols: &[String], json_field: Option<&str>, d: &dyn Dialect) -> Result<(String, String), String> {
+    if tok == "count" {
+        return Ok(("COUNT(*)".to_string(), "count".to_string()));
+    }
+    if let Some(o) = tok.find('(') {
+        if tok.ends_with(')') {
+            let func = &tok[..o];
+            let field = &tok[o + 1..tok.len() - 1];
+            if !soql_ident_ok(field) {
+                return Err(format!("champ invalide : {field}"));
+            }
+            let qf = soql_field(field, cols, json_field, d);
+            let sql = match func {
+                "count" => format!("COUNT({qf})"),
+                "sum" => format!("SUM({qf})"),
+                "avg" => format!("AVG({qf})"),
+                "min" => format!("MIN({qf})"),
+                "max" => format!("MAX({qf})"),
+                "dc" => format!("COUNT(DISTINCT {qf})"),
+                // OP 1 : agrégats LISTE (recon multi-valeur). `values` = valeurs DISTINCTES groupées,
+                // `list` = toutes (avec doublons). Anti-explosion mémoire (budget 2 Go) : la string
+                // concaténée est BORNÉE à 4096 c. par `substr(...,1,4096)` (un GROUP_CONCAT non borné
+                // sur un champ à forte cardinalité gonflerait la ligne agrégée sans limite).
+                "values" => d.group_concat_bounded(&qf, true, 4096),
+                "list" => d.group_concat_bounded(&qf, false, 4096),
+                _ => return Err(format!("fonction stats inconnue : {func}")),
+            };
+            return Ok((sql, func.to_string()));
+        }
+    }
+    Err(format!("stats : syntaxe invalide '{tok}' (count | sum(f) | avg(f) | min(f) | max(f) | dc(f) | values(f) | list(f))"))
+}
+
+pub(crate) fn soql_dur(s: &str) -> Result<i64, String> {
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: i64 = num.parse().map_err(|_| "span invalide".to_string())?;
+    let mult = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => return Err(format!("unité span inconnue : {unit}")),
+    };
+    Ok(n * mult)
+}
+
+pub(crate) fn soql_expr_sql(expr: &str, json_field: Option<&str>, cols: &[String], d: &dyn Dialect) -> Result<String, String> {
+    // Allowlist des fonctions d'eval = la const de complétion EXPOSÉE (source unique de vérité) : la
+    // complétion propose EXACTEMENT ce que ce chemin accepte -> aucune dérive possible (cf. SOQL_EVAL_FUNCTIONS).
+    const FNS: &[&str] = SOQL_EVAL_FUNCTIONS;
+    const DENY_KW: &[&str] = &[
+        "select", "from", "where", "union", "intersect", "except", "join", "using", "on", "by",
+        "group", "order", "having", "limit", "offset", "with", "as", "into", "values", "exists",
+        "pragma", "attach", "detach", "insert", "update", "delete", "drop", "alter", "create",
+        "replace", "returning", "vacuum", "reindex", "analyze", "over", "partition", "window", "cast",
+    ];
+    let chars: Vec<char> = expr.chars().collect();
+    let mut i = 0;
+    let mut out = String::new();
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            let q = c;
+            i += 1;
+            let mut s = String::new();
+            while i < chars.len() && chars[i] != q {
+                s.push(chars[i]);
+                i += 1;
+            }
+            if i >= chars.len() {
+                return Err("eval : chaîne non terminée".into());
+            }
+            i += 1;
+            // Échappement du littéral `eval` via le DIALECT (`escape_literal`),
+            // plus le doublage-quote EN DUR : SQLite/DuckDB émettent byte-identique (soql_esc), mais ClickHouse
+            // échappe AUSSI le backslash (`a\` -> `'a\\'`) — sans quoi un backslash final romprait la borne du
+            // littéral (injection). Cohérent avec tous les autres chemins de valeur du compilateur.
+            out.push('\'');
+            out.push_str(&d.escape_literal(&s));
+            out.push('\'');
+            continue;
+        }
+        if c.is_ascii_digit() || (c == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) {
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' {
+            let mut id = String::new();
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                id.push(chars[i]);
+                i += 1;
+            }
+            let mut j = i;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            let is_fn = j < chars.len() && chars[j] == '(';
+            let low = id.to_lowercase();
+            if matches!(low.as_str(), "and" | "or" | "not" | "in" | "like" | "between" | "is" | "glob" | "null" | "true" | "false") {
+                out.push_str(&low);
+            } else if is_fn {
+                if !FNS.contains(&low.as_str()) {
+                    return Err(format!("eval : fonction non autorisée : {id}"));
+                }
+                out.push_str(match low.as_str() {
+                    "len" => "length",
+                    "if" => "iif",
+                    _ => low.as_str(),
+                });
+            } else if DENY_KW.contains(&low.as_str()) {
+                return Err(format!("eval : mot-clé SQL non autorisé : {id}"));
+            } else if soql_ident_ok(&id) {
+                // FIELD FILTERS — CHOKE-POINT DU MASQUE dans `eval`. Résolution d'identifiant CALQUÉE
+                // sur `soql_field` (sémantique UNIQUE : eval et projection résolvent un identifiant à
+                // l'identique), avec garde stricte de parité mode 0 :
+                //  - SAC JSON (`fields`, TOUTE CASSE) : gardé BRUT à la base (source d'extraction des clés)
+                //    -> `eval x = fields` le COPIERAIT EN CLAIR dans une colonne aliasée, contournant
+                //    `mask_output_bag`. On route par `bag_wrap` (RETIRE les clés masquées du blob, fail-
+                //    closed). Comparaison INSENSIBLE À LA CASSE : SQLite plie la casse des noms de colonne,
+                //    donc `FIELDS`/`FiElDs`/`substr(FIELDS,…)` se résoudraient QUAND MÊME vers la colonne
+                //    brute `fields` — un match sensible à la casse (CVE mask-bypass) les laisserait fuir.
+                //    VIDE -> `bag_wrap` = None -> identifiant nu (byte-identique au legacy).
+                //  - COLONNE RÉELLE (`src_ip`, …) : DÉJÀ masquée à la projection de BASE (`base_proj_col`)
+                //    -> émise BRUTE ici (pas de re-masquage : un hash de hash serait faux). Mode 0 identique.
+                //  - IDENTIFIANT INCONNU (clé JSON pure, variante de casse, champ absent) : au lieu d'un
+                //    ÉCHO SQL BRUT (qui pouvait se résoudre vers une colonne masquée brute — CLASSE entière
+                //    du bypass, pas juste `fields`), on l'extrait du sac comme `soql_field` :
+                //    `d.json_extract(jf,'$.<id>')` + masque éventuel (NULL pour une clé absente : bénin).
+                //    STRICTEMENT NO-OP EN MODE 0 : gardé par `mask_active()` — sans aucun masque actif on
+                //    émet l'identifiant nu legacy (byte-identique ; parité différentielle intacte). Le
+                //    json_extract ne s'ACTIVE que lorsqu'un masque existe, donc jamais en mode 0.
+                match json_field {
+                    Some(jf) if id.eq_ignore_ascii_case(jf) && cols.iter().any(|c| c.eq_ignore_ascii_case(jf)) => {
+                        out.push_str(&bag_wrap(&soql_qid(jf), cols).unwrap_or_else(|| id.clone()));
+                    }
+                    _ if cols.iter().any(|c| *c == id) => out.push_str(&id),
+                    Some(jf) if mask_active() && cols.iter().any(|c| c == jf) => {
+                        let base = d.json_extract(jf, &id);
+                        out.push_str(&mask_wrap(&base, &id).unwrap_or(base));
+                    }
+                    _ => out.push_str(&id),
+                }
+            } else {
+                return Err(format!("eval : identifiant invalide : {id}"));
+            }
+            continue;
+        }
+        let two: String = chars[i..(i + 2).min(chars.len())].iter().collect();
+        match two.as_str() {
+            "==" => {
+                out.push('=');
+                i += 2;
+                continue;
+            }
+            "!=" | "<>" | "<=" | ">=" => {
+                out.push_str(&two);
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        match c {
+            '+' | '-' | '*' | '/' | '%' | '(' | ')' | ',' | '<' | '>' | '=' => {
+                out.push(c);
+                i += 1;
+            }
+            '.' => {
+                out.push_str(" || ");
+                i += 1;
+            }
+            _ => return Err(format!("eval : caractère non autorisé : '{c}'")),
+        }
+    }
+    Ok(out)
+}
+
+/// Découpe sur les pipes de PREMIER niveau (ignore les `|` dans les crochets `[ ... ]`). PUBLIC :
+/// la route-rollup de Plume (`try_rollup_route`) en dépend à la bascule.
+pub fn soql_split_pipes(s: &str) -> Vec<String> {
+    let (mut out, mut depth, mut cur) = (Vec::new(), 0i32, String::new());
+    for c in s.chars() {
+        match c {
+            '[' => { depth += 1; cur.push(c); }
+            ']' => { depth -= 1; cur.push(c); }
+            '|' if depth == 0 => { out.push(cur.trim().to_string()); cur.clear(); }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
+pub(crate) fn soql_bracket(stage: &str) -> Result<String, String> {
+    let start = stage.find('[').ok_or_else(|| "crochet '[' manquant (ex: append [search ...])".to_string())?;
+    let end = stage.rfind(']').ok_or_else(|| "crochet ']' manquant".to_string())?;
+    if end <= start + 1 {
+        return Err("sous-recherche vide".into());
+    }
+    Ok(stage[start + 1..end].trim().to_string())
+}
+
+pub(crate) fn soql_proj(target: &[String], have: &[String]) -> String {
+    let items: Vec<String> = target
+        .iter()
+        .map(|c| if have.iter().any(|h| h == c) { soql_qid(c) } else { format!("NULL AS {}", soql_qid(c)) })
+        .collect();
+    format!("SELECT {}", items.join(", "))
+}
+
+pub(crate) fn parse_value_filter(tok: &str) -> Option<(&'static str, f64)> {
+    let rest = tok.strip_prefix("value")?;
+    for (pat, sqlop) in [(">=", ">="), ("<=", "<="), ("!=", "<>"), ("=", "="), (">", ">"), ("<", "<")] {
+        if let Some(num) = rest.strip_prefix(pat) {
+            if let Ok(f) = num.trim().parse::<f64>() {
+                return Some((sqlop, f));
+            }
+        }
+    }
+    None
+}
