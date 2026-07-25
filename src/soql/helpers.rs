@@ -15,38 +15,131 @@ use super::*;
 /// Sortie STRICTEMENT identique à l'historique : `soql_tokenize_marked` en est la source unique,
 /// on n'en retire que le marqueur de guillemets.
 pub fn soql_tokenize(s: &str) -> Vec<String> {
-    let marked = soql_tokenize_marked(s);
-    marked.into_iter().map(|(t, _)| t).collect()
+    soql_tokenize_marked(s)
+        .into_iter()
+        .map(|t| t.text)
+        .collect()
 }
 
-/// Comme `soql_tokenize`, mais CONSERVE pour chaque jeton s'il a été construit avec des guillemets
-/// (`true` dès qu'un `"` a été consommé pendant sa construction).
+/// Un jeton, avec DE QUOI DÉCIDER SI SA PARTIE GAUCHE EST DU TEXTE QUE L'UTILISATEUR A QUOTÉ.
 ///
-/// POURQUOI : `soql_tokenize` JETTE les guillemets, donc l'aval ne peut plus distinguer
-/// `search "user-agent=curl"` (une PHRASE que l'analyste veut chercher telle quelle) de
-/// `search user-agent=curl` (un nom de champ mal écrit). C'est la cause racine des refus abusifs
-/// mesurés sur des phrases quotées légitimes. Le marqueur sert UNIQUEMENT à EXEMPTER un jeton quoté
-/// de la garde de nom de champ (cf. `table_conds`) : il n'ouvre aucun chemin nouveau et ne change
-/// aucune émission SQL.
-pub(crate) fn soql_tokenize_marked(s: &str) -> Vec<(String, bool)> {
-    let (mut out, mut cur, mut inq, mut quoted) = (Vec::new(), String::new(), false, false);
-    for c in s.chars() {
+/// POURQUOI CETTE STRUCTURE : `soql_tokenize` JETTE les guillemets, donc l'aval ne peut plus
+/// distinguer `search "user-agent=curl"` (une PHRASE que l'analyste cherche telle quelle) de
+/// `search user-agent=curl` (un nom de champ mal écrit). Un simple booléen « ce jeton contenait un
+/// guillemet » NE SUFFIT PAS, et c'est la cause racine MESURÉE du contournement : dans
+/// `x-forwarded-for="10.0.0.1"` les guillemets n'entourent que la VALEUR, la partie gauche reste un
+/// nom de champ nu — un booléen de jeton exemptait pourtant le jeton ENTIER. On conserve donc la
+/// position réelle de la quotation, pas sa simple présence.
+#[derive(Clone)]
+pub(crate) struct SoqlTok {
+    /// Texte du jeton, guillemets RETIRÉS (strictement ce que rendait l'historique `soql_tokenize`).
+    pub(crate) text: String,
+    /// Bornes OCTETS du jeton dans le texte qui a été tokenisé, GUILLEMETS COMPRIS : `&src[beg..end]`
+    /// rend exactement les octets que l'utilisateur a tapés pour ce jeton (cf. `soql_bad_field_msg`,
+    /// qui suggère ce texte-là et non une reconstruction).
+    pub(crate) beg: usize,
+    pub(crate) end: usize,
+    /// Nombre d'OCTETS DE TÊTE de `text` qui ont été produits À L'INTÉRIEUR de guillemets.
+    lead: usize,
+    /// Un guillemet est resté OUVERT à la fin du texte : la quotation n'est pas close.
+    open: bool,
+}
+
+impl SoqlTok {
+    /// LA décision, prise ICI ET NULLE PART AILLEURS : « les `n` premiers octets de ce jeton
+    /// sont-ils du texte que l'utilisateur a lui-même mis entre guillemets ? »
+    ///
+    /// C'est le SEUL prédicat d'exemption de la garde de nom de champ, et il porte sur un PRÉFIXE
+    /// (la partie gauche d'un opérateur), jamais sur le jeton entier :
+    /// dans `"user-agent=curl"` tout le jeton vient des guillemets, donc sa partie gauche aussi : c'est
+    /// une PHRASE ; dans `x-forwarded-for="1"` seule la VALEUR en vient, la partie gauche reste nue :
+    /// c'est un FILTRE, et la garde s'applique.
+    ///
+    /// Une quotation NON CLOSE n'exempte rien (`open`) : sinon un seul `"` égaré suffirait à faire
+    /// passer n'importe quel jeton pour une phrase.
+    pub(crate) fn quoted_prefix(&self, n: usize) -> bool {
+        !self.open && self.lead >= n
+    }
+
+    /// Recolle `other` à la fin de ce jeton (cf. `soql_glue_spaced_ops`) : le TEXTE se concatène, les
+    /// bornes source s'étendent jusqu'à celles d'`other` (le fragment fusionné couvre donc les octets
+    /// SOURCE des deux, séparateurs compris), la quotation de tête reste celle du PREMIER fragment, et
+    /// une quotation non close de l'un contamine le tout.
+    pub(crate) fn absorb(&mut self, other: &SoqlTok) {
+        self.text.push_str(&other.text);
+        self.end = other.end;
+        self.open |= other.open;
+    }
+
+    /// Les octets SOURCE dont ce jeton provient, guillemets RETIRÉS. C'est ce texte-là qui est
+    /// suggéré à l'utilisateur (cf. `soql_bad_field_msg`) plutôt qu'une reconstruction depuis le
+    /// jeton, laquelle perdait les espaces et la ponctuation qu'il avait tapés.
+    ///
+    /// Les guillemets sont RETIRÉS parce que ce sont des DÉLIMITEURS que le tokenizer ne conserve
+    /// jamais : un terme qui en contient ne peut pas être re-quoté tel quel (SOQL n'a pas
+    /// d'échappement). Que re-jouer la suggestion rende bien un plein-texte SUR CE TEXTE est MESURÉ
+    /// (`s11_error_suggestion_is_the_users_own_text`), pas déduit.
+    pub(crate) fn source_unquoted(&self, src: &str) -> String {
+        src[self.beg..self.end].replace('"', "")
+    }
+}
+
+/// Comme `soql_tokenize`, mais rend des `SoqlTok` (position de la quotation + bornes source) au lieu
+/// de simples `String`. La CONSTRUCTION DU TEXTE du jeton est inchangée ligne pour ligne : mêmes
+/// jetons, même découpe, même retrait des guillemets — `soql_tokenize` n'en est plus qu'une projection.
+pub(crate) fn soql_tokenize_marked(s: &str) -> Vec<SoqlTok> {
+    let mut out: Vec<SoqlTok> = Vec::new();
+    let mut cur = String::new();
+    let (mut inq, mut lead, mut in_lead, mut beg, mut started) =
+        (false, 0usize, true, 0usize, false);
+    for (i, c) in s.char_indices() {
         match c {
             '"' => {
+                if !started {
+                    beg = i;
+                    started = true;
+                }
                 inq = !inq;
-                quoted = true;
             }
             c if c.is_whitespace() && !inq => {
                 if !cur.is_empty() {
-                    out.push((std::mem::take(&mut cur), quoted));
+                    out.push(SoqlTok {
+                        text: std::mem::take(&mut cur),
+                        beg,
+                        end: i,
+                        lead,
+                        open: false,
+                    });
                 }
-                quoted = false;
+                started = false;
+                lead = 0;
+                in_lead = true;
             }
-            c => cur.push(c),
+            c => {
+                if !started {
+                    beg = i;
+                    started = true;
+                }
+                // Le préfixe quoté s'arrête au PREMIER caractère produit hors guillemets.
+                if in_lead {
+                    if inq {
+                        lead += c.len_utf8();
+                    } else {
+                        in_lead = false;
+                    }
+                }
+                cur.push(c);
+            }
         }
     }
     if !cur.is_empty() {
-        out.push((cur, quoted));
+        out.push(SoqlTok {
+            text: cur,
+            beg,
+            end: s.len(),
+            lead,
+            open: inq,
+        });
     }
     out
 }
@@ -61,8 +154,8 @@ pub(crate) fn soql_ident_ok(s: &str) -> bool {
 /// partie gauche ne prétend pas nommer un champ (horodatage `10:00:00`, chemin/URL), qui garde le scan
 /// plein-texte. Un identifiant VALIDE (`soql_ident_ok`) est un sous-ensemble de cette forme.
 /// DEUX APPELANTS, tous deux dans `mod.rs` : le recollage `soql_glue_spaced_ops` (pour que la forme
-/// espacée `foo-bar = 1` redevienne UN jeton) et la garde de `table_conds`. Une PHRASE QUOTÉE est
-/// exemptée en amont sur le marqueur de `soql_tokenize_marked`, PAS par cette fonction.
+/// espacée `foo-bar = 1` redevienne UN jeton) et la garde de `table_conds`. Cette fonction NE SAIT
+/// RIEN des guillemets : l'exemption d'un texte quoté est tranchée par `SoqlTok::quoted_prefix`.
 pub(crate) fn soql_fieldish(s: &str) -> bool {
     let mut cs = s.chars();
     matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
@@ -328,6 +421,16 @@ pub(crate) fn soql_expr_sql(expr: &str, json_field: Option<&str>, cols: &[String
             } else if DENY_KW.contains(&low.as_str()) {
                 return Err(format!("eval : mot-clé SQL non autorisé : {id}"));
             } else if soql_ident_ok(&id) {
+                // LIMITE ASSUMÉE ET MESURÉE — la garde de nom de champ de `table_conds` n'a PAS
+                // d'équivalent ici, et ne peut pas en avoir : dans une EXPRESSION, `-` est l'opérateur
+                // de soustraction. `search | eval x = foo-bar` rend `(foo-bar)` — mesuré — c'est-à-dire
+                // exactement le SQL de `eval x = foo - bar`, et l'entrée ne porte AUCUNE information qui
+                // distingue « nom de champ mal écrit » de « soustraction de deux champs » (`severity-1`
+                // est légitime et s'écrit sans blancs). Refuser `a-b` casserait l'arithmétique ; refuser
+                // un identifiant inconnu casserait `eval x = dport * 2` sur une clé JSON, qui n'est pas
+                // énumérable. Conséquence : un nom de champ mal écrit dans `eval` échoue à l'EXÉCUTION
+                // (colonne inexistante) et non à la compilation. Les 16 autres étapes, elles, refusent
+                // (cf. `eval_is_the_documented_blind_spot_of_the_field_name_guard`).
                 // FIELD FILTERS — CHOKE-POINT DU MASQUE dans `eval`. Résolution d'identifiant CALQUÉE
                 // sur `soql_field` (sémantique UNIQUE : eval et projection résolvent un identifiant à
                 // l'identique), avec garde stricte de parité mode 0 :
