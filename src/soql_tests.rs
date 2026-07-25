@@ -1479,3 +1479,35 @@
         assert!(ok.contains("(ts/3600)*3600"), "bucket 1h attendu : {ok}");
     }
 
+    // --- S2 : bornes de compilation (nombre d'étapes + taille du SQL émis) ---------------------
+    #[test]
+    fn s2_pipeline_stage_count_is_bounded() {
+        // Aucune borne n'existait sur le NOMBRE d'étapes de pipe : 2000 étapes compilaient.
+        let q = format!("search{}", " | head 5".repeat(2000));
+        let e = to_sql(&q, 0, 0, &Schema::events()).expect_err("un pipeline de 2000 étapes doit être refusé");
+        assert!(e.contains("étape"), "l'erreur doit parler des étapes : {e}");
+    }
+
+    #[test]
+    fn s2_emitted_sql_size_is_bounded() {
+        // Mesure du rapport : `eventstats values(...)` interpole le SQL courant DEUX fois par étage
+        // -> croissance en 4^k. k=16 produisait ~14 Mo de SQL (k=24 ≈ 3,6 Gio = OOM sous 2 Go).
+        // ATTENDU : Err claire au dépassement de la borne de taille, pas un buffer illimité.
+        let q = format!("search{}", " | eventstats values(user) by src_ip".repeat(16));
+        let e = to_sql(&q, 0, 0, &Schema::events()).expect_err("la croissance 4^k doit être bornée");
+        assert!(e.to_lowercase().contains("complexe") || e.to_lowercase().contains("taille"), "erreur de taille attendue : {e}");
+    }
+
+    #[test]
+    fn s2_realistic_queries_still_compile() {
+        // Garde-fou : les bornes ne doivent RIEN changer pour une requête légitime réaliste
+        // (le corpus différentiel 99 requêtes est la référence ; ces 3 en sont des représentantes).
+        for q in [
+            "search source=web scope=external | stats count by src_ip | sort -count | head 20",
+            "search source=cloudflare | stats values(user) by src_ip",
+            "search source=web | eventstats count by src_ip | where count > 10 | stats count",
+        ] {
+            to_sql(q, 0, 0, &Schema::events()).unwrap_or_else(|e| panic!("doit compiler ({q}) : {e}"));
+        }
+    }
+
