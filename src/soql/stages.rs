@@ -35,7 +35,17 @@ pub(crate) fn compile_timechart(toks: &[&str], mut sql: String, mut ocols: Vec<S
     for t in &toks[1..head_end] {
         if let Some(s) = t.strip_prefix("span=") {
             span = soql_dur(s)?;
-        } else if !t.contains('=') {
+        } else if t.contains('=') {
+            // S1 — FAIL-CLOSED. Seul le préfixe EXACT `span=` était reconnu ; tout autre jeton CONTENANT
+            // `=` était ignoré sans un mot, puis `if span <= 0` substituait le bucket automatique — la
+            // requête ne mesurait alors PAS la fenêtre demandée. Mesuré : `spans=…`, `SPAN=1h`,
+            // `span =1h` compilaient tous les trois avec `(ts/900)*900`. C'est la substitution
+            // silencieuse que S1 dit fermer, atteignable sans aucun débordement ; on refuse, comme
+            // `metric` refuse un jeton `k=v` inconnu.
+            return Err(format!(
+                "timechart : option inconnue : {t} (seul `span=<durée>` est supporté, ex: span=1h)"
+            ));
+        } else {
             aggtok = t;
         }
     }

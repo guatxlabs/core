@@ -1799,3 +1799,47 @@
         // Séparation par virgule (avec ou sans espace) : toujours acceptée.
         assert!(to_sql("metric http_requests_total by code, job", 0, 0, &ev).is_ok());
     }
+
+    // --- S1 (suite) : un jeton `k=v` inconnu de `timechart` n'est plus ignoré en silence --------
+    #[test]
+    fn s1_unknown_timechart_option_is_error() {
+        // MESURÉ sur 4b16822 : la boucle ne reconnaissait que le PRÉFIXE EXACT `span=` ; tout autre jeton
+        // CONTENANT `=` était ignoré sans un mot, puis `if span <= 0` substituait le bucket automatique.
+        //   search | timechart spans=200000000000000d count -> (ts/900)*900   (Ok !)
+        //   search | timechart SPAN=1h count                -> (ts/900)*900   (Ok !)
+        //   search | timechart span =1h count               -> (ts/900)*900   (Ok !)
+        // La requête ne mesure alors PAS la fenêtre demandée : c'est la substitution silencieuse que S1
+        // dit fermer, atteignable sans aucun débordement. Même règle que le `metric` fail-closed.
+        for (q, tok) in [
+            ("search | timechart spans=200000000000000d count", "spans="),
+            ("search | timechart SPAN=1h count", "SPAN=1h"),
+            ("search | timechart span =1h count", "=1h"),
+            ("search | timechart span=1h limit=10 count", "limit=10"),
+        ] {
+            match to_sql(q, 0, 0, &Schema::events()) {
+                Ok(sql) => panic!("attendu une erreur pour « {q} », obtenu du SQL : {sql}"),
+                Err(e) => assert!(e.contains(tok), "l'erreur doit nommer le jeton {tok} : {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn s1_legitimate_timechart_forms_are_unchanged() {
+        // ANTI-RÉGRESSION : 5 formes `timechart` légitimes rendent le MÊME SQL (goldens littéraux).
+        let ev = Schema::events();
+        let b = "SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event";
+        assert_eq!(
+            to_sql("search | timechart span=1h count", 0, 0, &ev).unwrap(),
+            format!("SELECT (ts/3600)*3600 AS bucket,COUNT(*) AS \"count\" FROM ({b}) GROUP BY bucket ORDER BY bucket")
+        );
+        assert_eq!(
+            to_sql("search | timechart count", 0, 0, &ev).unwrap(),
+            format!("SELECT (ts/900)*900 AS bucket,COUNT(*) AS \"count\" FROM ({b}) GROUP BY bucket ORDER BY bucket")
+        );
+        assert_eq!(
+            to_sql("search | timechart span=5m count by source", 0, 0, &ev).unwrap(),
+            format!("SELECT (ts/300)*300 AS bucket,\"source\" AS \"source\",COUNT(*) AS \"count\" FROM ({b}) GROUP BY bucket,\"source\" ORDER BY bucket")
+        );
+        assert!(to_sql("search source=svc-audit vtype=response | timechart count", 0, 0, &ev).is_ok());
+        assert!(to_sql("metric http_requests_total job=api | timechart avg(value)", 0, 0, &ev).is_ok());
+    }
