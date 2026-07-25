@@ -149,41 +149,50 @@ pub fn parse_stix_pattern(pattern: &str) -> Result<Vec<(&'static str, String)>, 
     if p.is_empty() {
         return Err("empty pattern".into());
     }
-    // Reject qualifiers / multi-observation operators outright (case-insensitive word check).
-    // The check runs on the pattern's STRUCTURE ONLY (`pattern_structure` blanks out the content of
-    // quoted string literals): an operator name is a token of the pattern, never part of a value. A
-    // substring match on the WHOLE pattern used to throw away VALID IOCs with a WRONG reason —
-    // `[url:value='http://x/likely-bad']` was rejected as "LIKE", `within.example.com` as "WITHIN" —
-    // i.e. exactly the silent detection blind spot this module's header promises to avoid.
-    let up = pattern_structure(p).to_ascii_uppercase();
+    // ONE structural view feeds EVERY structural check below — operator denylist, observation
+    // brackets, AND/OR split, equality split. `pattern_structure` blanks the CONTENT of each
+    // single-quoted STIX string literal (keeping its quotes) with the same `\'` / `\\` escaping as
+    // `unquote_stix`, and is BYTE-ALIGNED with `p`, so every offset it yields slices `p` correctly.
+    // Reading a VALUE as if it were structure is what threw valid IOCs away:
+    // `[url:value='http://[2001:db8::1]:8080/a']` was refused as a multi-observation pattern because
+    // `find('[')`/`rfind(']')`/`contains('[')` still ran on the RAW pattern — exactly the silent
+    // detection blind spot this module's header promises to avoid. Deriving the split points from
+    // the same view also keeps them from disagreeing with `unquote_stix` about where a literal ends.
+    let (structure, unterminated) = pattern_structure(p);
+    if unterminated {
+        return Err("unterminated string literal in pattern".into());
+    }
+    // Reject qualifiers / multi-observation operators outright (case-insensitive check).
+    let up = structure.to_ascii_uppercase();
     for bad in ["FOLLOWEDBY", "REPEATS", "WITHIN", "LIKE", "MATCHES", "ISSUBSET", "ISSUPERSET", " IN ", " IN(", "!=", "<=", ">=", "<", ">"] {
         if up.contains(bad) {
             return Err(format!("unsupported pattern operator/qualifier ({})", bad.trim()));
         }
     }
     // Single observation only: must be exactly one [...] group. Extract the innermost content.
-    let open = p.find('[').ok_or("pattern is not a STIX observation ([...])")?;
-    let close = p.rfind(']').ok_or("pattern is not a STIX observation ([...])")?;
+    let open = structure.find('[').ok_or("pattern is not a STIX observation ([...])")?;
+    let close = structure.rfind(']').ok_or("pattern is not a STIX observation ([...])")?;
     if close <= open {
         return Err("malformed observation brackets".into());
     }
     // A second observation group -> multi-observation, unsupported.
-    if p[open + 1..close].contains('[') {
+    if structure[open + 1..close].contains('[') {
         return Err("multi-observation pattern (unsupported)".into());
     }
-    let inner = p[open + 1..close].trim();
+    let (inner, inner_st) = trim_pair(&p[open + 1..close], &structure[open + 1..close], false);
     // AND-combined comparisons cannot be reduced to independent IOCs without over-matching -> reject.
-    if split_top(inner, " AND ").len() > 1 {
+    if split_top(inner, inner_st, " AND ").len() > 1 {
         return Err("AND-combined comparisons (unsupported — would over-match)".into());
     }
     let mut out: Vec<(&'static str, String)> = Vec::new();
-    for term in split_top(inner, " OR ") {
-        let term = term.trim().trim_matches(|c| c == '(' || c == ')').trim();
+    for (raw_term, raw_term_st) in split_top(inner, inner_st, " OR ") {
+        let (term, term_st) = trim_pair(&raw_term, &raw_term_st, true);
         if term.is_empty() {
             continue;
         }
-        // Split on the FIRST '=' (equality only; '!='/'<='/'>=' already rejected above).
-        let eq = term.find('=').ok_or_else(|| format!("comparison without '=' : '{term}'"))?;
+        // Split on the FIRST '=' OF THE STRUCTURE (equality only; '!='/'<='/'>=' rejected above), so
+        // a '=' inside a value or a quoted path key cannot move the boundary.
+        let eq = term_st.find('=').ok_or_else(|| format!("comparison without '=' : '{term}'"))?;
         let lhs = term[..eq].trim();
         let rhs_raw = term[eq + 1..].trim();
         let kind = stix_path_to_kind(lhs)?;
@@ -197,13 +206,23 @@ pub fn parse_stix_pattern(pattern: &str) -> Result<Vec<(&'static str, String)>, 
 }
 
 /// Return a same-shape view of `s` in which the CONTENT of every single-quoted STIX string literal is
-/// replaced by spaces (the quotes themselves are kept). Used to scan the pattern's STRUCTURE — object
-/// paths, operators, qualifiers — without ever looking inside a VALUE. `\'` and `\\` inside a literal
-/// do not close it (same escaping as `unquote_stix`). One character in, one character out, so the view
-/// stays readable in errors; it is only used for substring checks, never for byte offsets into `s`.
-fn pattern_structure(s: &str) -> String {
+/// replaced by spaces (the quotes themselves are kept), plus a flag telling whether a literal was left
+/// OPEN at the end of `s`. Used to scan the pattern's STRUCTURE — object paths, operators, qualifiers,
+/// brackets, separators — without ever looking inside a VALUE. `\'` and `\\` inside a literal do not
+/// close it (same escaping as `unquote_stix`).
+///
+/// BYTE-ALIGNED: a blanked character is replaced by as many spaces as it occupies bytes, so
+/// `view.len() == s.len()` and any offset found in the view slices `s` at the same place. Offsets are
+/// only ever taken at characters copied VERBATIM (brackets, separators, `=`), which are ASCII and thus
+/// always land on a character boundary of `s`.
+fn pattern_structure(s: &str) -> (String, bool) {
     let mut out = String::with_capacity(s.len());
     let (mut in_q, mut esc) = (false, false);
+    let blank = |out: &mut String, c: char| {
+        for _ in 0..c.len_utf8() {
+            out.push(' ');
+        }
+    };
     for c in s.chars() {
         if !in_q {
             if c == '\'' {
@@ -212,29 +231,65 @@ fn pattern_structure(s: &str) -> String {
             out.push(c);
         } else if esc {
             esc = false;
-            out.push(' ');
+            blank(&mut out, c);
         } else {
             match c {
                 '\\' => {
                     esc = true;
-                    out.push(' ');
+                    blank(&mut out, c);
                 }
                 '\'' => {
                     in_q = false;
                     out.push('\'');
                 }
-                _ => out.push(' '),
+                _ => blank(&mut out, c),
             }
         }
     }
-    out
+    (out, in_q)
 }
 
-/// Split `s` on a case-insensitive separator, but ONLY at bracket/paren depth 0 and outside single
-/// quotes. Keeps `'a OR b'` string literals and `(...)` groups intact. Separator must be surrounded by
-/// the given form (already includes spaces, e.g. " OR ").
-fn split_top(s: &str, sep: &str) -> Vec<String> {
-    let up = s.to_ascii_uppercase();
+/// Trim `(text, view)` in LOCKSTEP: the whitespace (and, with `parens`, the surrounding `(`/`)` layer)
+/// is located on the byte-aligned structural VIEW, and the SAME byte range is applied to both, so the
+/// two can never disagree on where a term starts and ends. A literal's blanked content is spaces, but
+/// its quotes are not, so trimming stops at the quote and never reaches inside a value.
+fn trim_pair<'a>(text: &'a str, view: &'a str, parens: bool) -> (&'a str, &'a str) {
+    debug_assert_eq!(text.len(), view.len());
+    let b = view.as_bytes();
+    let (mut lo, mut hi) = (0usize, view.len());
+    let trim_ws = |lo: &mut usize, hi: &mut usize| {
+        while *lo < *hi && b[*lo].is_ascii_whitespace() {
+            *lo += 1;
+        }
+        while *hi > *lo && b[*hi - 1].is_ascii_whitespace() {
+            *hi -= 1;
+        }
+    };
+    trim_ws(&mut lo, &mut hi);
+    if parens {
+        while lo < hi && (b[lo] == b'(' || b[lo] == b')') {
+            lo += 1;
+        }
+        while hi > lo && (b[hi - 1] == b'(' || b[hi - 1] == b')') {
+            hi -= 1;
+        }
+        trim_ws(&mut lo, &mut hi);
+    }
+    (&text[lo..hi], &view[lo..hi])
+}
+
+/// Split `(s, view)` on a case-insensitive separator, but ONLY at bracket/paren depth 0 and outside
+/// string literals. Keeps `'a OR b'` string literals and `(...)` groups intact. Separator must be
+/// surrounded by the given form (already includes spaces, e.g. " OR ").
+///
+/// The scan runs on the byte-aligned structural VIEW, where a literal's content is already blanked
+/// with the same `\'` / `\\` escaping as `unquote_stix`; both halves are returned so the caller keeps
+/// the pair aligned. Scanning the RAW string instead made this splitter and `unquote_stix` disagree
+/// about where a literal ends: `[url:value='a\' OR domain-name:value=\'evil.com']` was cut INSIDE the
+/// value and refused with a reason that named a fragment the author never wrote.
+fn split_top(s: &str, view: &str, sep: &str) -> Vec<(String, String)> {
+    debug_assert_eq!(s.len(), view.len());
+    let up = view.to_ascii_uppercase();
     let sep_up = sep.to_ascii_uppercase();
     let sb = sep_up.as_bytes();
     let bytes = up.as_bytes();
@@ -252,14 +307,14 @@ fn split_top(s: &str, sep: &str) -> Vec<String> {
             _ => {}
         }
         if !in_q && depth == 0 && i + sb.len() <= bytes.len() && &bytes[i..i + sb.len()] == sb {
-            parts.push(s[start..i].to_string());
+            parts.push((s[start..i].to_string(), view[start..i].to_string()));
             i += sb.len();
             start = i;
             continue;
         }
         i += 1;
     }
-    parts.push(s[start..].to_string());
+    parts.push((s[start..].to_string(), view[start..].to_string()));
     parts
 }
 
@@ -431,6 +486,61 @@ mod tests {
             ("[domain-name:value='matches-evil.example']", "domain", "matches-evil.example"),
             ("[url:value='http://x/repeats']", "url", "http://x/repeats"),
             ("[url:value='http://x/?a=1<2']", "url", "http://x/?a=1<2"),
+        ] {
+            let got = parse_stix_pattern(pattern)
+                .unwrap_or_else(|e| panic!("IOC valide rejeté : {pattern} -> {e}"));
+            assert_eq!(got, vec![(kind, value.to_string())], "{pattern}");
+        }
+    }
+
+    // S3-bis — TOUS les contrôles de structure (crochets d'observation, découpe AND/OR, découpe de
+    // l'égalité, denylist) doivent lire la MÊME vue structurelle, avec la MÊME règle d'échappement.
+    // Un IOC rejeté à tort est un ANGLE MORT DE DÉTECTION, pas un détail cosmétique : ces motifs
+    // sont valides et ordinaires sur un flux TI public.
+    #[test]
+    fn parse_valid_ioc_corpus_is_never_rejected() {
+        for (pattern, kind, value) in [
+            // les 5 cas déjà mesurés par la revue
+            (
+                "[url:value='http://x/likely-bad']",
+                "url",
+                "http://x/likely-bad",
+            ),
+            (
+                "[domain-name:value='within.example.com']",
+                "domain",
+                "within.example.com",
+            ),
+            (
+                "[domain-name:value='matches-evil.example']",
+                "domain",
+                "matches-evil.example",
+            ),
+            ("[url:value='http://x/repeats']", "url", "http://x/repeats"),
+            ("[url:value='http://x/?a=1<2']", "url", "http://x/?a=1<2"),
+            // URL à littéral IPv6 : les crochets sont DANS la valeur, pas une 2e observation
+            (
+                "[url:value='http://[2001:db8::1]:8080/a']",
+                "url",
+                "http://[2001:db8::1]:8080/a",
+            ),
+            // crochets dans le CHEMIN de l'URL
+            ("[url:value='http://x/a[0]']", "url", "http://x/a[0]"),
+            // valeur contenant une quote ÉCHAPPÉE suivie de « OR » : la découpe ne doit pas couper
+            // à l'intérieur du littéral (les deux vues doivent s'accorder sur sa fin)
+            (
+                r"[url:value='a\' OR domain-name:value=\'evil.com']",
+                "url",
+                r"a' OR domain-name:value='evil.com",
+            ),
+            // nom d'opérateur DANS la valeur, collé à des crochets
+            (
+                "[url:value='http://x/[within]/[repeats]']",
+                "url",
+                "http://x/[within]/[repeats]",
+            ),
+            // valeur NON-ASCII + crochet : la vue structurelle doit préserver les OFFSETS D'OCTETS
+            ("[url:value='http://x/café[1]']", "url", "http://x/café[1]"),
         ] {
             let got = parse_stix_pattern(pattern)
                 .unwrap_or_else(|e| panic!("IOC valide rejeté : {pattern} -> {e}"));
