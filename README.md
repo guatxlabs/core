@@ -118,7 +118,15 @@ l'énumération, et ils ne nomment aucune étape :
 - `no_typed_field_list_can_evaporate_whatever_the_step` **lit le dispatcheur** et le compilateur de
   chaque étape, en dérive les positions de liste (*une position est une liste de noms si changer les
   noms change le SQL*) et vérifie sur chacune, sur les 4 schémas livrés, qu'une liste sans aucun nom
-  est refusée ;
+  est refusée. Deux modes, de portée différente et c'est écrit : quand la liste est **tout
+  l'argument** (`fields X`, `table X`), la détection est purement comportementale, indépendante de la
+  façon dont l'étape découpe ; quand un **mot-clé** l'introduit (`by`, `OUTPUT`), ce mot-clé est lu
+  dans le compilateur de l'étape — les mots-clés des étapes livrées le sont, une étape *future* qui
+  introduirait une liste par un mot-clé que ce test ne détecte pas y échapperait. Cette limite reste
+  une affaire de *projection perdue*, jamais de sécurité : l'invariant « aucun nom non valide n'atteint
+  le SQL » est tenu à part et **universellement**, pour toute étape présente ou future, par
+  `no_user_written_name_reaches_the_sql_raw` (il plante un nom porteur d'un guillemet dans chaque
+  position d'argument de chaque étape et vérifie qu'il n'atteint jamais le SQL émis) ;
 - `every_comma_split_of_the_compiler_is_the_door_or_a_written_exception` **lit la source** : tout
   découpage sur la virgule est soit la porte, soit une exception déclarée avec sa raison (valeurs de
   `in`, paires de `rename`, arguments de macro). Le détecteur clé sur le **séparateur virgule** (une
