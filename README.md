@@ -41,9 +41,9 @@ let c = compile("search severity=HIGH | stats count by mitre | sort -count", &Sc
 // délégué au `Dialect` de la cible (SQLite/DuckDB/ClickHouse), c'est le point d'étranglement unique.
 ```
 ```sh
-cargo test                   # 160 tests (154 unitaires + 5 parité différentielle + 1 doctest)
-cargo test --features forge  # 180 tests (schéma + tests Forge activés)
-cargo test --all-features    # 189 tests (+ modules `ai` et `cold_tier`)
+cargo test                   # 161 tests (155 unitaires + 5 parité différentielle + 1 doctest)
+cargo test --features forge  # 181 tests (schéma + tests Forge activés)
+cargo test --all-features    # 190 tests (+ modules `ai` et `cold_tier`)
 ```
 
 ### Nom de champ et recherche plein-texte
@@ -90,10 +90,19 @@ une expression, `-` est l'opérateur de soustraction. `search | eval x = foo-bar
 diffèrent que par des blancs (mesuré par le test ci-dessous), et SQLite les compile en le **même
 programme** (mesuré : `EXPLAIN SELECT (foo-bar) FROM t` et `EXPLAIN SELECT (foo - bar) FROM t` rendent
 un bytecode identique, sqlite 3.53.3). Rien dans l'entrée ne sépare donc les deux lectures ; un nom mal
-écrit y échoue à l'**exécution** (colonne inexistante) et non à la compilation. Les autres étapes qui
-prennent un nom de champ (`where`, `stats by`, `table`, `fields`, `sort`, `dedup`, `top`, `rename`,
-`mvexpand`, `eventstats`, `timechart by`, `metric by`, `lookup`) le valident (test
-`eval_is_the_documented_blind_spot_of_the_field_name_guard`).
+écrit y échoue à l'**exécution** (colonne inexistante) et non à la compilation ; même là, un `'` isolé
+est rejeté (`eval : chaîne non terminée`), pas inliné brut.
+
+**Aucun nom écrit ne ressort brut dans le SQL — propriété dérivée, non énumérée.** Un nom de champ qui
+atteint le SQL doit être soit **refusé** (un identifiant valide ne contient pas de guillemet simple),
+soit ressortir **échappé** (une valeur légitime a son `'` doublé). Le test
+`no_user_written_name_reaches_the_sql_raw_whatever_the_step` engendre depuis le dispatcheur — sans
+nommer d'étape — un jeton portant un `'` dans chaque position d'argument de chaque étape, sur les 4
+schémas, et vérifie que sa **forme brute** n'apparaît jamais dans le SQL émis : sinon un nom aurait fui
+sans validation (`json_extract(fields,'$.a'b')`, littéral cassé) ou une valeur serait sortie non
+échappée. C'est ce qui remplace l'ancienne énumération à la main (qui prétendait lister « les autres
+étapes » et oubliait `rex` et `join`, tous deux mesurés comme validant) — `eval` reste la seule
+exception documentée ci-dessus, et elle refuse quand même le `'` non terminé.
 
 **Une liste de champs séparée par des virgules est décidée à un seul endroit** (`FieldList`) : `stats
 by`, `timechart by`, `eventstats by`, `metric by`, `fields`, `dedup`, `table` et `lookup … OUTPUT`.
@@ -112,7 +121,14 @@ l'énumération, et ils ne nomment aucune étape :
   est refusée ;
 - `every_comma_split_of_the_compiler_is_the_door_or_a_written_exception` **lit la source** : tout
   découpage sur la virgule est soit la porte, soit une exception déclarée avec sa raison (valeurs de
-  `in`, paires de `rename`, arguments de macro). Un nouveau découpage à la main fait échouer le test.
+  `in`, paires de `rename`, arguments de macro). Le détecteur clé sur le **séparateur virgule** (une
+  ligne portant `split` — toute la famille, `split`/`splitn`/`split_once`/`split_terminator`/
+  `split_inclusive`/`rsplit` — **et** un littéral virgule `','` ou `","`), donc un nouveau découpage à
+  la main le fait échouer quelle que soit la méthode. **Hors de portée, et c'est écrit dans le test :**
+  une virgule cachée derrière une constante nommée ou un cast numérique, ou un split étalé sur
+  plusieurs lignes — obfuscations qu'on n'écrit pas par accident. La **garantie** pour les étapes du
+  dispatcheur reste la garde d'EFFET ci-dessus, qui constate le résultat quelle que soit l'écriture ;
+  celle-ci est un garde-fou de forme.
 
 `table` et `lookup … OUTPUT` ont une grammaire différente — le **blanc** y est aussi un séparateur
 (`table a b` et `OUTPUT a b` sont légitimes, mesuré) — donc une *suite* de séparateurs y est
@@ -163,7 +179,7 @@ demande **pas** de redémarrer le service ; en revanche une valeur valide déjà
 redémarrage.
 
 ## Statut
-- ✅ Compilateur de Plume **promu + généralisé** ici (18 étapes de pipeline, schéma-générique). Suite complète : 160 tests (180 avec `--features forge`).
+- ✅ Compilateur de Plume **promu + généralisé** ici (18 étapes de pipeline, schéma-générique). Suite complète : 161 tests (181 avec `--features forge`).
 - ✅ Consommé par la console Forge et par Plume via une **git-dep épinglée par tag** :
   `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.0" }` — un clone autonome de
   l'un ou l'autre produit compile sans avoir ce dépôt en voisin.
