@@ -2360,6 +2360,34 @@ AND lk.\"key\"=\"src_ip\"";
         }
     }
 
+    /// TOUTES les sources du sous-module `soql`, VÉRIFIÉES exhaustives contre les `mod …;` déclarés
+    /// par `soql/mod.rs` : un sous-module ajouté sans être relu ici fait échouer les gardes au lieu
+    /// de créer un angle mort. C'est la MÊME liste pour les DEUX gardes engendrées — l'asymétrie qui
+    /// laissait la garde d'EFFET ne lire QUE `stages.rs` (donc rater un compilateur vivant dans
+    /// `mod.rs`) est fermée en la faisant lire d'ici.
+    fn soql_sources() -> Vec<(&'static str, &'static str)> {
+        // `include_str!` exige un chemin LITTÉRAL : la liste ne peut pas être calculée, elle est donc
+        // vérifiée juste après contre les `mod …;` déclarés.
+        let files: Vec<(&str, &str)> = vec![
+            ("mod.rs", include_str!("soql/mod.rs")),
+            ("helpers.rs", include_str!("soql/helpers.rs")),
+            ("stages.rs", include_str!("soql/stages.rs")),
+            ("knowledge.rs", include_str!("soql/knowledge.rs")),
+            ("dialect.rs", include_str!("soql/dialect.rs")),
+            ("mask.rs", include_str!("soql/mask.rs")),
+        ];
+        let declared: Vec<String> = files[0]
+            .1
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("mod ").and_then(|r| r.strip_suffix(';')))
+            .filter(|m| *m != "tests")
+            .map(|m| format!("{m}.rs"))
+            .collect();
+        let unread: Vec<&String> = declared.iter().filter(|m| !files.iter().any(|(f, _)| f == m)).collect();
+        assert!(unread.is_empty(), "sous-module déclaré mais non relu par les gardes : {unread:?}");
+        files
+    }
+
     /// Les littéraux d'une portion de source, dans l'ordre.
     fn string_literals(seg: &str) -> Vec<&str> {
         let (mut out, mut i) = (Vec::new(), 0usize);
@@ -2458,7 +2486,11 @@ AND lk.\"key\"=\"src_ip\"";
         //    indiscernable d'un argument ABSENT — l'étape nue est un contrat à part (`table` nu est
         //    un passe-plat délibéré). On n'exige donc le refus que des formes portant une VIRGULE.
         let modsrc = include_str!("soql/mod.rs");
-        let stgsrc = include_str!("soql/stages.rs");
+        // LES MOTS-CLÉS SONT LUS DANS TOUTES LES SOURCES, PAS SEULEMENT `stages.rs` : un compilateur
+        // d'étape peut vivre dans `mod.rs` (`by_fields`, `metric_base`, et n'importe quelle étape
+        // future). `fn_body` sur cette concaténation le trouve où qu'il soit ; l'assertion plus bas
+        // exige qu'il SOIT trouvé, au lieu de rendre une chaîne vide en silence.
+        let allsrc: String = soql_sources().iter().map(|(_, s)| *s).collect::<Vec<_>>().join("\n");
         let steps = dispatcher_steps(modsrc);
         assert!(steps.len() >= 18, "le dispatcheur n'a pas été lu : {steps:?}");
 
@@ -2478,7 +2510,13 @@ AND lk.\"key\"=\"src_ip\"";
             let base = if *sname == "forge" { "runs" } else { "search" };
             let sql_of = |q: &str| to_sql(q, 0, 0, sch).ok();
             for (step, f) in &steps {
-                let kws = keywords_of(fn_body(stgsrc, f));
+                let body = fn_body(&allsrc, f);
+                assert!(
+                    !body.is_empty(),
+                    "compilateur `{f}` (étape `{step}`) introuvable dans les sources relues : la garde \
+                     d'effet ne peut pas lire ses mots-clés — angle mort de FICHIER, pas de forme"
+                );
+                let kws = keywords_of(body);
 
                 // (1) LA LISTE EST TOUT L'ARGUMENT — le préfixe est forcément vide.
                 if let (Some(x), Some(y)) = (
@@ -2537,9 +2575,99 @@ AND lk.\"key\"=\"src_ip\"";
             leaks.len(),
             leaks.join("\n")
         );
-        // Un test qui ne trouve AUCUNE position de liste passerait à vide : on le dit avec un chiffre
-        // MESURÉ, qui échoue si la dérivation cesse de voir les étapes.
-        assert!(positions >= 28, "positions de liste trouvées : {positions} (dérivation cassée ?)");
+        // UN TEST QUI NE TROUVE AUCUNE POSITION PASSERAIT À VIDE. Le plancher est posé sur la valeur
+        // MESURÉE, pas au tiers : la couverture par schéma est CONSTANTE (chaque schéma expose les
+        // mêmes positions de liste), donc `positions == <par-schéma> × nb_schémas`. Réglé sur la vraie
+        // mesure : 28 positions PAR schéma, soit 84 sur les 3 schémas par défaut, 112 avec
+        // `--features forge` (4 schémas).
+        //
+        // Deux mutations que ce réglage attrape et que `>= 28` laissait passer :
+        //  - mutS (retirer 2 des 3 schémas de la liste ci-dessus) : `schemas.len()` tombe à 1 -> échec.
+        //  - mutK (casser la détection de mots-clés) : les positions à mot-clé s'évaporent -> échec.
+        assert!(
+            schemas.len() >= 3,
+            "couverture de schémas réduite à {} : la dérivation doit tourner sur tous les schémas livrés",
+            schemas.len()
+        );
+        const PER_SCHEMA: usize = 28;
+        assert_eq!(
+            positions,
+            PER_SCHEMA * schemas.len(),
+            "positions de liste : mesurées {positions}, attendues {} ({PER_SCHEMA} par schéma × {} \
+             schémas). Une étape à liste ajoutée/retirée, ou la dérivation cassée : mettre à jour \
+             PER_SCHEMA avec la valeur mesurée (et le README).",
+            PER_SCHEMA * schemas.len(),
+            schemas.len()
+        );
+    }
+
+    #[test]
+    fn no_user_written_name_reaches_the_sql_raw_whatever_the_step() {
+        // LA MOITIÉ SCALAIRE DE LA DÉRIVATION — le pendant de la porte des LISTES, pour le nom de champ
+        // SEUL, et pour la classe INJECTION. Elle remplace une énumération à la main du README (qui
+        // oubliait `rex` et `join`) par une propriété MESURÉE, sans nommer aucune étape.
+        //
+        // L'ORACLE, DÉRIVÉ : un nom de champ écrit par l'utilisateur qui atteint le SQL doit être SOIT
+        // refusé — un identifiant valide (`soql_ident_ok`) ne contient PAS de guillemet simple —, SOIT
+        // ressortir échappé — une valeur légitime a son `'` doublé. Donc un jeton portant un `'` ne doit
+        // JAMAIS apparaître SOUS SA FORME BRUTE dans le SQL émis. S'il y est, un nom a fui sans
+        // validation (`json_extract(fields,'$.a'b')` : le `'` casse le littéral, du SQL invalide part au
+        // store) ou une valeur est sortie non échappée. La forme échappée `zq''qz` NE contient PAS la
+        // forme brute `zq'qz` — le test ne se déclenche donc que sur une vraie fuite.
+        //
+        // MESURÉ sur l'arbre : AUCUNE étape ne fuit. `eval` lui-même refuse le `'` non terminé
+        // (« chaîne non terminée »), `search foo=a'b` émet `'a''b'`, `rex`/`sort`/`join`/… refusent le
+        // nom invalide. C'est donc une propriété vérifiée, pas une liste espérée.
+        const NEEDLE: &str = "zq'qz";
+        let modsrc = include_str!("soql/mod.rs");
+        let allsrc: String = soql_sources().iter().map(|(_, s)| *s).collect::<Vec<_>>().join("\n");
+        let steps = dispatcher_steps(modsrc);
+        let schemas: Vec<(&str, Schema)> = vec![
+            ("events", Schema::events()),
+            ("events_duckdb", Schema::events_duckdb()),
+            ("events_clickhouse", Schema::events_clickhouse()),
+            #[cfg(feature = "forge")]
+            ("forge", Schema::forge()),
+        ];
+        let (mut probed, mut leaks) = (0usize, Vec::<String>::new());
+        for (sname, sch) in &schemas {
+            let base = if *sname == "forge" { "runs" } else { "search" };
+            let sql_of = |q: &str| to_sql(q, 0, 0, sch).ok();
+            for (step, f) in &steps {
+                // Un nom de champ apparaît en position d'ARGUMENT NU, de LISTE, d'alias, d'expression,
+                // et derrière chaque mot-clé de l'étape. On couvre les cinq, plus les mots-clés lus dans
+                // le compilateur (où qu'il vive) — la même dérivation que la porte des listes.
+                let mut forms: Vec<String> = vec![
+                    format!("{base} | {step} {NEEDLE}"),
+                    format!("{base} | {step} {NEEDLE},{NEEDLE}"),
+                    format!("{base} | {step} {NEEDLE} AS y"),
+                    format!("{base} | {step} x = {NEEDLE}"),
+                    format!("{base} | {step} {NEEDLE} \"(?<u>x)\""),
+                ];
+                for k in keywords_of(fn_body(&allsrc, f)) {
+                    for p in arg_prefixes() {
+                        forms.push(format!("{base} | {step} {p} {k} {NEEDLE}"));
+                        forms.push(format!("{base} | {step} {p} {k} {NEEDLE},{NEEDLE}"));
+                    }
+                }
+                for q in forms {
+                    probed += 1;
+                    if let Some(sql) = sql_of(&q) {
+                        if sql.contains(NEEDLE) {
+                            leaks.push(format!("[{sname}/{step}] « {q} » -> {sql}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            leaks.is_empty(),
+            "un nom écrit par l'utilisateur est ressorti BRUT dans le SQL — nom non validé ou valeur \
+             non échappée ({} cas) :\n{}",
+            leaks.len(),
+            leaks.join("\n")
+        );
+        assert!(probed > 200, "trop peu de formes sondées ({probed}) : la dérivation ne voit plus les étapes");
     }
 
     #[test]
@@ -2552,12 +2680,20 @@ AND lk.\"key\"=\"src_ip\"";
         // ÉCRITE ICI AVEC SA RAISON. Un 6e site apparaît -> ce test échoue, et le contributeur lit
         // quoi faire. Aucune étape n'est nommée : c'est la FORME du défaut qui est interdite.
         //
-        // PORTÉE EXACTE, MESURÉE, NON UNIVERSELLE : le détecteur lit LIGNE À LIGNE, donc un découpage
-        // écrit sur plusieurs lignes (`.split(\n    ',',\n)`) lui échappe. Mesuré sur une 21e étape
-        // ajoutée exprès : ce test-ci ne bronche pas, et `no_typed_field_list_can_evaporate_whatever_
-        // _the_step` la refuse quand même (152 passed / 2 failed). Les deux gardes ne se recouvrent
-        // pas par hasard : celle-ci interdit la FORME du défaut, l'autre en constate l'EFFET — c'est
-        // l'effet qui compte, et il reste couvert quelle que soit l'écriture.
+        // PORTÉE EXACTE, MESURÉE, NON UNIVERSELLE. Le détecteur clé sur le SÉPARATEUR VIRGULE, pas sur
+        // le nom de la méthode : il repère une ligne qui contient à la fois `split` (la famille entière
+        // — `split`, `splitn`, `split_once`, `split_terminator`, `split_inclusive`, `rsplit`…) ET un
+        // littéral virgule (`','` ou `","`). C'est le DÉNOMINATEUR COMMUN de tout découpage sur la
+        // virgule, pas une liste d'idiomes tenue à jour à la main. Reste HORS de portée, et c'est écrit :
+        //  - une virgule cachée derrière une constante nommée DÉCLARÉE SUR UNE AUTRE LIGNE (`const C:
+        //    char = ','` ailleurs, puis `s.split(C)`) ou un cast numérique (`s.split(0x2C as char)`) —
+        //    aucun littéral virgule sur la ligne du split (MESURÉ : la même déclaration écrite SUR la
+        //    ligne du split, elle, est bien vue — c'est la ligne, pas la portée, qui est lue) ;
+        //  - un découpage étalé sur plusieurs lignes (lecture ligne à ligne).
+        // Ces évasions sont des obfuscations qu'un contributeur n'écrit pas par accident. LA GARANTIE
+        // pour les étapes du dispatcheur reste la garde d'EFFET (`no_typed_field_list…`) : elle constate
+        // le résultat quelle que soit l'écriture, sur toutes les étapes que le dispatcheur expose. Cette
+        // garde-ci est un garde-fou de FORME, pas la preuve.
         const DECLARED: [(&str, &str, &str); 5] = [
             ("helpers.rs", "commas", "LA PORTE — virgule seule (`by`, `fields`, `dedup`)"),
             ("helpers.rs", "commas_or_blanks", "LA PORTE — virgule ou blanc (`table`, `lookup … OUTPUT`)"),
@@ -2565,26 +2701,9 @@ AND lk.\"key\"=\"src_ip\"";
             ("stages.rs", "compile_rename", "liste de PAIRES `a AS b` : chaque segment est validé, une liste vide est refusée — rien n'y est jeté"),
             ("knowledge.rs", "parse_macro_call", "arguments d'appel de MACRO, pas des noms de champs ; aucune entrée n'y est jetée"),
         ];
-        // `include_str!` exige un chemin LITTÉRAL : la liste des fichiers ne peut pas être calculée.
-        // Elle est donc VÉRIFIÉE juste après, contre les `mod …;` déclarés par `soql/mod.rs` — un
-        // sous-module ajouté sans être lu ici fait échouer le test au lieu de créer un angle mort.
-        let files: [(&str, &str); 6] = [
-            ("mod.rs", include_str!("soql/mod.rs")),
-            ("helpers.rs", include_str!("soql/helpers.rs")),
-            ("stages.rs", include_str!("soql/stages.rs")),
-            ("knowledge.rs", include_str!("soql/knowledge.rs")),
-            ("dialect.rs", include_str!("soql/dialect.rs")),
-            ("mask.rs", include_str!("soql/mask.rs")),
-        ];
-        let declared_mods: Vec<String> = files[0]
-            .1
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("mod ").and_then(|r| r.strip_suffix(';')))
-            .filter(|m| *m != "tests")
-            .map(|m| format!("{m}.rs"))
-            .collect();
-        let unread: Vec<&String> = declared_mods.iter().filter(|m| !files.iter().any(|(f, _)| f == m)).collect();
-        assert!(unread.is_empty(), "sous-module déclaré mais non relu par ce test : {unread:?}");
+        // La liste des fichiers — VÉRIFIÉE exhaustive contre les `mod …;` déclarés — est partagée avec
+        // la garde d'effet (`soql_sources`) : les deux gardes lisent EXACTEMENT le même périmètre.
+        let files = soql_sources();
         let mut found: Vec<(String, String)> = Vec::new();
         for (fname, src) in files {
             let mut cur = String::new();
@@ -2600,7 +2719,11 @@ AND lk.\"key\"=\"src_ip\"";
                         cur = n;
                     }
                 }
-                if code.contains(".split(") && code.contains("','") {
+                // DÉCOUPAGE SUR LA VIRGULE = la famille `split*` ET un littéral virgule sur la même
+                // ligne (cf. bandeau de portée). Clé sur le séparateur, pas sur l'idiome.
+                let splits = code.contains("split");
+                let comma_lit = code.contains("','") || code.contains("\",\"");
+                if splits && comma_lit {
                     found.push((fname.to_string(), cur.clone()));
                 }
             }
