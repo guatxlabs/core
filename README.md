@@ -189,8 +189,10 @@ redémarrage.
 ## Statut
 - ✅ Compilateur de Plume **promu + généralisé** ici (18 étapes de pipeline, schéma-générique). Suite complète : 161 tests (181 avec `--features forge`).
 - ✅ Consommé par la console Forge et par Plume via une **git-dep épinglée par tag** :
-  `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.0" }` — un clone autonome de
-  l'un ou l'autre produit compile sans avoir ce dépôt en voisin.
+  `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.1" }` — un clone autonome de
+  l'un ou l'autre produit compile sans avoir ce dépôt en voisin. **Épinglez `v0.2.1` ou plus récent** :
+  `v0.2.0` émettait, sur une entrée non fiable, des filtres portant sur une colonne que l'utilisateur
+  n'avait jamais nommée (faux négatif silencieux dans une règle de détection) — cf. les notes du tag `v0.2.1`.
 - ✅ **Adoption par Plume terminée** : harnais de parité différentielle sur le corpus des requêtes
   livrées avec le produit (banc `tests/plume_parity.rs`, 0 divergence inattendue), bascule du daemon, puis suppression
   du compilateur interne. Aucune fonctionnalité perdue — ce cœur est désormais l'unique implémentation.
