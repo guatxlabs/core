@@ -19,6 +19,11 @@ Licensed under LGPL-3.0-or-later, see [COPYING.LESSER](COPYING.LESSER).
   Le **module Rust reste `soql`** : le renommage porte sur le **nom du langage**, pas sur l'API — les
   identifiants publics (`guatx_core::soql::*`, `soql_esc`, `GUATX_SOQL_MAX_*`) sont **inchangés**, la
   lib est taguée v0.2.1 et consommée telle quelle par Plume et Forge.
+  **La frontière du renommage, pour qu'elle ne soit pas prise pour un oubli :** ce qu'un UTILISATEUR
+  lit dit `GXQL` (interfaces, documentation, messages d'erreur rendus) ; ce qu'un CONTRIBUTEUR lit
+  garde `soql` (nom de module, identifiants, et les commentaires de `src/soql/` qui les décrivent).
+  Renommer la prose d'un module qui s'appelle `soql`, à côté de fonctions `soql_*`, aurait rendu le
+  code MOINS lisible, pas plus. Le critère est donc l'API, pas le fichier.
   Le compilateur **type-SPL complet de Plume**, promu ici et rendu **schéma-générique**
   (`Schema::events()` pour Plume · `Schema::forge()` pour Forge). Une base (`search` / `metric` /
   `<alt>`) puis **18 étapes de pipeline**, sous **20 noms** (`head`/`limit` et `top`/`rare` sont deux
