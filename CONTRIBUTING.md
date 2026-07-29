@@ -1,6 +1,6 @@
 # Contributing to guatx-core
 
-Thanks for your interest in guatx-core — the shared, security-critical core of GuatX (the SOQL
+Thanks for your interest in guatx-core — the shared, security-critical core of GuatX (the GXQL
 compiler + masking/scoping layer that both Plume and the Forge console depend on). Contributions are
 welcome, under a few rules that exist because this crate is **safety-critical**: a bug here breaks a
 control in *both* products at once.
@@ -13,7 +13,7 @@ by signing off your commits (`git commit -s` → adds `Signed-off-by:`).
 
 A pull request that weakens any of these will be **rejected**, no matter how useful the feature:
 
-- **One SOQL compiler — never fork it.** The compiler is the single masking/scoping choke-point that
+- **One GXQL compiler — never fork it.** The compiler is the single masking/scoping choke-point that
   serves both Plume (`Schema::events()`) and Forge (`Schema::forge()`). Fix and extend it *in place*.
   Do not copy it, special-case a caller, or add a second code path that emits SQL — a fork is a
   control that drifts out of sync and eventually diverges from the audited one.

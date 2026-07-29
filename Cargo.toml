@@ -17,7 +17,7 @@ path = "src/lib.rs"
 
 [features]
 # `forge` — code SPÉCIFIQUE au produit Forge (rouge) isolé du cœur. DÉFAUT OFF : Plume (et un
-# Plume open-source) compile SANS lui -> le compilateur SOQL partagé reste UNIQUE (pas de fork),
+# Plume open-source) compile SANS lui -> le compilateur GXQL partagé reste UNIQUE (pas de fork),
 # seul le schéma Forge (`Schema::forge()`, colonne `engagement_id`) et ses tests sont retirés du
 # build Plume. Le MÉCANISME générique de row-scoping (`RowFilter`/`with_row_filter`) reste TOUJOURS
 # disponible aux deux (réutilisable pour le scoping tenant Plume). Forge active ce flag via sa dep :
@@ -29,8 +29,8 @@ forge = []
 # cœur). Sans la feature, la variante ET ses bras de match n'existent PAS -> build/tests cœur DÉFAUT
 # byte-identiques. Activée transitivement par la feature `cold_tier` du daemon (`guatx-core/cold_tier`).
 cold_tier = []
-# IA CONSEIL (advisory) — NL→SOQL, OFF par défaut. Gate le module `ai` (SPI `AiProvider` +
-# pipeline NL→SOQL, PUR `std`, ZÉRO dép nouvelle). Sans la feature, `mod ai` n'existe PAS -> build/tests
+# IA CONSEIL (advisory) — NL→GXQL, OFF par défaut. Gate le module `ai` (SPI `AiProvider` +
+# pipeline NL→GXQL, PUR `std`, ZÉRO dép nouvelle). Sans la feature, `mod ai` n'existe PAS -> build/tests
 # cœur DÉFAUT byte-identiques (mode-0). Le daemon Plume active la couche (impls réseau/vendeur) via
 # `guatx-core/ai` ; le cœur ne porte QUE le contrat + helpers purs (rédaction, prompt, compilo-couture).
 ai = []

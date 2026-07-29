@@ -1,7 +1,7 @@
 # Security Policy
 
 guatx-core is the **shared, security-critical core** of GuatX: a single audited implementation of
-the SOQL query compiler and the field-masking / row-scoping layer that both Plume (blue SOC) and the
+the GXQL query compiler and the field-masking / row-scoping layer that both Plume (blue SOC) and the
 Forge console (red) depend on. A flaw here defeats a control in *both* products at once, so we want
 to hear about it.
 
@@ -30,7 +30,7 @@ and scoping *by construction*. A security bug is anything that defeats that. In 
   `soql_field` should have wrapped in its mask (hash) or `Deny` expression to come through in the
   clear. `soql_field` is the single provenance choke-point; any path that reaches a column value
   without going through it (bypassing the compile-time `field_masks`) is in scope.
-- **SOQL injection / compiler escape** — crafted query text that escapes value-quoting/inlining and
+- **GXQL injection / compiler escape** — crafted query text that escapes value-quoting/inlining and
   injects SQL, or that makes the compiler emit anything other than the intended read-only query
   (mutation, sub-query to an unintended table, stacked statement).
 - **RowFilter / authorizer bypass** — reading rows outside the caller's scope: defeating a
@@ -61,7 +61,7 @@ are not maintained; please upgrade.
 
 ## Hardening & audits
 
-The core safety controls — the single SOQL compiler, the `soql_field` masking choke-point, `Deny`
+The core safety controls — the single GXQL compiler, the `soql_field` masking choke-point, `Deny`
 / hash masks applied at compile time, `RowFilter` row-scoping, and secret redaction/zeroization —
 are covered by tests (including a differential parity bench against the origin Plume compiler) and a
 CI pipeline that runs `cargo audit` and secret scanning on every push.
