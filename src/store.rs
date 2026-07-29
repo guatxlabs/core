@@ -125,7 +125,7 @@ impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StoreError::Backend(m) => write!(f, "store backend error: {m}"),
-            StoreError::Emit(m) => write!(f, "soql emission error: {m}"),
+            StoreError::Emit(m) => write!(f, "GXQL emission error: {m}"),
             StoreError::WrongHandle { expected, got } => {
                 write!(f, "wrong store handle: impl expects `{expected}`, got `{got}`")
             }
