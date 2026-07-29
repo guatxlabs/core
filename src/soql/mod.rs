@@ -1152,7 +1152,7 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
     }
     let stages = soql_split_pipes(&expanded);
     if stages.is_empty() {
-        return Err("soql vide".into());
+        return Err("GXQL vide".into());
     }
     // S2 (a) — BORNE DU NOMBRE D'ÉTAPES. Rien ne bornait la LONGUEUR du pipeline (`depth > 3` ne borne que
     // l'imbrication des sous-recherches, `MACRO_MAX_LEN` que l'expansion de macros) : une requête de viewer
@@ -1282,7 +1282,7 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
             "join" => compile_join(stage, sql, ocols, from, to, depth, schema)?,
             "mvexpand" => compile_mvexpand(&toks, sql, ocols, jf, d)?,
             "lookup" => compile_lookup(&toks, sql, ocols, jf, d)?,
-            other => return Err(format!("commande soql inconnue : '{other}'")),
+            other => return Err(format!("commande GXQL inconnue : '{other}'")),
         };
         sql = ns;
         ocols = no;

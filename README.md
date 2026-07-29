@@ -14,7 +14,12 @@ Licensed under LGPL-3.0-or-later, see [COPYING.LESSER](COPYING.LESSER).
   **critiques** → une seule implémentation auditée vaut mieux que deux qui divergent.
 
 ## Contenu
-- `soql` — le compilateur **type-SPL complet de Plume**, promu ici et rendu **schéma-générique**
+- `soql` — le compilateur **GXQL** (*GuatX Query Language* ; **anciennement appelé « SOQL »** — même
+  langage, même syntaxe, seul le nom change : `SOQL` était le nom du langage de requête de Salesforce).
+  Le **module Rust reste `soql`** : le renommage porte sur le **nom du langage**, pas sur l'API — les
+  identifiants publics (`guatx_core::soql::*`, `soql_esc`, `GUATX_SOQL_MAX_*`) sont **inchangés**, la
+  lib est taguée v0.2.1 et consommée telle quelle par Plume et Forge.
+  Le compilateur **type-SPL complet de Plume**, promu ici et rendu **schéma-générique**
   (`Schema::events()` pour Plume · `Schema::forge()` pour Forge). Une base (`search` / `metric` /
   `<alt>`) puis **18 étapes de pipeline**, sous **20 noms** (`head`/`limit` et `top`/`rare` sont deux
   paires d'alias) : `stats` · `timechart` · `where` · `sort` · `head`/`limit` · `rex` · `fields` ·
