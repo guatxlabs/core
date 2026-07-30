@@ -99,6 +99,18 @@ jobs:
         with:
           fetch-depth: 0   # full history so gitleaks can scan past commits, not just the tip.
 
+      # AVANT gitleaks, et pour cause : un octet NUL dans un fichier suivi le fait classer en
+      # `data`, et `grep` SANS `-a` le saute EN SILENCE. Mesuré dans le dépôt frère `forge` —
+      # un NUL dans un commentaire de code, et grep y trouvait 0 occurrence d'un motif présent
+      # 9 fois : un secret déposé là n'aurait été vu par personne. La garde n'énumère aucun
+      # fichier : elle exige que TOUT fichier suivi porteur d'un NUL soit déclaré binaire dans
+      # `.gitattributes` — donc un fichier ajouté demain est couvert par construction — et que
+      # la déclaration reste étroite, pour qu'un `*.rs binary` ne la désarme pas d'une ligne.
+      # Ce dépôt n'a AUCUN binaire suivi (27 fichiers, 0 NUL) : la garde y est préventive, et
+      # c'est sa seule position utile — ajoutée après coup, elle ne prouverait rien sur le passé.
+      - name: Aucun octet NUL non déclaré (sinon les scans de secrets sautent le fichier)
+        run: python3 .github/scripts/check_no_stray_nul.py
+
       - name: Setup Rust toolchain (pinné)
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # @stable (no semver tags; pinned to stable branch commit)
         with:
