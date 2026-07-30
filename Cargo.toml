@@ -2,7 +2,7 @@
 name = "guatx-core"
 # Le manifeste suit le TAG de release : bumper ici à chaque release et taguer le commit correspondant,
 # pour qu'un consommateur en dépendance git résolve bien la version qu'annonce le tag.
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.96"           # = la toolchain épinglée par la CI ; exprimée ici pour que `cargo` la vérifie.
 license = "LGPL-3.0-or-later"   # SPDX. `-or-later` = lecture conventionnelle « v3 » ; passer à
