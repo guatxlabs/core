@@ -186,9 +186,27 @@ pub const SOQL_KEYWORDS: &[&str] = &["by", "span=", "as", "OUTPUT"];
 /// fields,'$.X'))` QUE si la requête émet EXACTEMENT la même expression texte. Un `CAST` change
 /// l'expression -> l'index expression n'est pas retenu par le planner (dégradation de performance
 /// sur de gros volumes).
+///
+/// ORDRE SIGNIFICATIF : le consommateur (plume, `daemon/src/soql_glue.rs`) porte une copie de cette
+/// liste et une assertion `const` compare les deux ÉLÉMENT PAR ÉLÉMENT. Un ajout doit donc être fait
+/// EN QUEUE et RÉPLIQUÉ à l'identique, sinon plume ne compile plus (c'est l'effet recherché : on ne
+/// se souvient pas de synchroniser, on est empêché de désynchroniser).
+///
+/// `dir` et `risk` (ajoutés le 2026-08-05) — CE QUI LES FAIT ENTRER : des règles de détection
+/// LIVRÉES les filtrent, donc leur chaleur est DÉMONTRÉE, pas supposée. `dir=outbound` : trois
+/// règles du catalogue (`ex-egress-fanout-external`, `lm-conntrack-internal-ssh`,
+/// `di-conntrack-internal-sweep`) ; `risk=public` : une règle (`cl-minio-public-bucket`). Ces deux
+/// champs étaient auparavant censés être servis par un mécanisme d'auto-index piloté par la chaleur
+/// d'usage — mécanisme qui n'a jamais promu un seul index et qui a été RETIRÉ. Un champ que du
+/// contenu livré interroge appartient à la liste MAINTENUE et vérifiée, pas à un mécanisme absent.
+/// Tous deux sont TEXTUELS et de cardinalité bornée (`inbound|outbound` ;
+/// `admin|rw|ro|diag|public`), donc conformes à l'invariant ci-dessus — la suppression du
+/// `CAST(... AS REAL)` qu'entraîne leur présence ici ne peut pas fausser une comparaison, aucun
+/// émetteur livré ne les écrit en nombre.
 pub const HOT_FIELDS: &[&str] = &[
     "action", "user", "owner", "kind", "ns", "role", "scope",
     "verb", "resource", "operation",
+    "dir", "risk",
 ];
 
 #[derive(Clone)]
