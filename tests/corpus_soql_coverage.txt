@@ -128,6 +128,11 @@ search dport in (80,443)
 search source=web dport in (80,443,8080) | stats count by src_ip
 search | where dport in (80,443) | stats count
 search | where user not in (root,ubuntu) | stats count by src_ip
+# `in` POSITIF de niveau base, liste NON entièrement numérique = seul cas `COLLATE NOCASE` du compilo.
+# Sans ces trois lignes, la branche NOCASE du miroir plume_parity est du code MORT (mutation non détectée).
+search source in (web,cloudflare)
+search source in (80,web)
+search user in (root,ubuntu) | stats count by src_ip
 
 # --- Opérateurs SQL espacés (glue) : `champ = "x"` doit se recoller comme `champ=x` ---
 search source = web
