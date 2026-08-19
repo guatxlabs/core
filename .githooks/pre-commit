@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# GARDE D'IDENTITÉ PUBLIQUE — copie EXTRAITE du hook de plume (même défaut, même remède).
+# `core` est publié sous guatxlabs ; l'identité git GLOBALE de la machine de dev est un
+# compte personnel, dont tout clone frais hérite. Le `.mailmap` répare l'affichage, cette
+# garde empêche le prochain commit de repartir sous la mauvaise identité.
+# INSTALLATION (une fois par clone) :  git config core.hooksPath .githooks
+set -euo pipefail
+
+racine="$(git rev-parse --show-toplevel)"
+
+# ── IDENTITÉ PUBLIQUE ───────────────────────────────────────────────────────────────────
+# CE QUI S'EST PASSÉ. L'identité git GLOBALE de la machine de développement est un compte
+# GitHub PERSONNEL. Tout dépôt sans réglage LOCAL en hérite, et un `git clone` frais perd
+# la config locale : c'est ainsi que l'historique public a fini avec deux auteurs pour une
+# seule personne.
+#
+# POURQUOI LE CANONIQUE EST ÉCRIT ICI ET PLUS DANS `.mailmap`. Un `.mailmap` a été essayé
+# puis RETIRÉ : il ne change pas la page « Contributors » de GitHub, qui apparie les
+# commits à des comptes par leur ADRESSE — vérifié, l'ancien compte y figurait toujours.
+# Garder un fichier qui ne tient pas sa promesse est pire que ne pas l'avoir. La garde,
+# elle, tient : elle empêche le PROCHAIN commit de partir sous la mauvaise identité. Son
+# canonique vit donc ici, à un seul endroit, dans le seul fichier qui le consomme.
+#
+# CE N'EST PAS UNE FRONTIÈRE DE SÉCURITÉ : `--no-verify` la contourne, et c'est assumé.
+CANONIQUE="guatxlabs <noreply@guatx.com>"
+actuel="$(git var GIT_AUTHOR_IDENT | sed 's/ [0-9]\{9,\} [+-][0-9]\{4\}$//')"
+if [ "$actuel" != "$CANONIQUE" ]; then
+    echo "[pre-commit] REFUS : ce commit partirait sous « $actuel »." >&2
+    echo "             Ce dépôt public publie sous « $CANONIQUE »." >&2
+    echo "             Cause la plus fréquente : la config git GLOBALE de la machine, héritée" >&2
+    echo "             faute de réglage local — un clone frais y retombe systématiquement." >&2
+    echo "             Geste :  git config user.name guatxlabs && git config user.email noreply@guatx.com" >&2
+    exit 1
+fi

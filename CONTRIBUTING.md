@@ -80,3 +80,36 @@ guatx-core exists so the critical primitives — read-only compilation, masking,
 **one** audited implementation shared by both products. Contributions that would give a caller a way
 around those controls, or that split them into a second divergent path, are out of scope for this
 project.
+
+## Écrire pour le public
+
+Ce dépôt est public. Tout ce qui y est écrit — messages de commit, documentation,
+commentaires de code — s'adresse au **lecteur futur du code**, pas à une personne ni à une
+conversation.
+
+**Un message de commit dit CE QUI CHANGE et POURQUOI.** Il n'a pas à raconter le
+déroulement du travail. À proscrire :
+
+- nommer une personne, ou citer un échange privé ;
+- le récit à la première personne (« j'ai essayé », « ma première version ») ;
+- les repères de session (« hier », « ce matin », « la quatrième fois aujourd'hui ») ;
+- un chemin machine (`/home/<compte>`), un pseudo personnel, une adresse tierce.
+
+Ce qui a de la valeur et doit rester : la **mesure** (chiffres et date), ce qui a été
+**réfuté**, et la **raison** d'un choix de conception. Le journal de travail, lui, a sa
+place dans un dépôt interne — pas dans l'historique public.
+
+**Identité.** Tous les commits sont signés `guatxlabs <noreply@guatx.com>`. À poser dans
+chaque clone, car un clone frais hérite de la configuration globale de la machine :
+
+```sh
+git config user.name  "guatxlabs"
+git config user.email "noreply@guatx.com"
+git config core.hooksPath .githooks   # arme les gardes ci-dessous
+```
+
+**Deux gardes versionnées** appliquent le mécanisable : `pre-commit` refuse un commit dont
+l'auteur n'est pas le canonique ; `commit-msg` refuse un message portant un chemin machine,
+un pseudo personnel ou une adresse tierce. Le STYLE, lui, n'est pas mécanisé : une garde
+qui prétendrait en juger produirait du bruit et finirait désarmée. Il se tient à la
+relecture.
