@@ -28,9 +28,18 @@ fi
 # ── IDENTIFIANTS : rien de personnel ni de machine ──────────────────────────────────────
 printf '%s' "$corps" | grep -qE "/home/[a-z][a-z0-9_-]*" && ajoute "chemin machine (/home/<compte>)"
 printf '%s' "$corps" | grep -qi "xguatx"                 && ajoute "compte personnel"
+# ── CO-SIGNATURE : aucune, et ce n'est pas cosmetique ──────────────────────────────────
+# GitHub construit la page « Contributors » en comptant AUSSI les trailers Co-Authored-By
+# de la branche par defaut, et il apparie par ADRESSE. Un trailer portant une adresse
+# rattachee a un compte fait donc figurer ce compte parmi les contributeurs du projet.
+# Ce depot n'en affiche qu'un : celui qui engage sa responsabilite sur le code.
+# Le controle porte sur le FICHIER, pas sur `corps` — `corps` retire deja ces lignes, et
+# une garde qui lirait `corps` ne pourrait jamais rien trouver.
+grep -qiE '^co-authored-by:' "$f" && ajoute "trailer Co-Authored-By — il ferait apparaitre un compte de plus sur la page Contributors"
+
 # ── ADRESSES : uniquement le domaine du projet ─────────────────────────────────────────
-# Les trailers Co-Authored-By sont exclus du corps plus haut : une co-signature est un fait,
-# pas une adresse de contact. Basculer en STRICT = retirer le `grep -v` de la ligne `corps`.
+# Les trailers sont retires de `corps` plus haut pour que ce controle-ci ne les voie pas
+# deux fois : ils sont deja refuses en bloc par la section CO-SIGNATURE.
 if printf '%s' "$corps" | grep -qoE "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}" \
    && printf '%s' "$corps" | grep -oE "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}" | grep -qvE "@guatx\.com$"; then
   ajoute "adresse hors @guatx.com"
