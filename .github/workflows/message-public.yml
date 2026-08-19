@@ -38,3 +38,14 @@ jobs:
           done
           echo "messages verifies : $n · refuses : $ko"
           [ "$ko" -eq 0 ]
+      - name: Identite canonique sur la plage poussee
+        run: |
+          # Le hook local se contourne et disparait a chaque clone frais ; c'est ICI que la
+          # regle lie. Le canonique n'est ecrit qu'une fois, dans le script appele.
+          base='${{ github.event.before }}'
+          if [ -z "$base" ] || [ "$base" = '0000000000000000000000000000000000000000' ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            plage=HEAD
+          else
+            plage="$base..HEAD"
+          fi
+          ./.github/scripts/verifier-identite.sh "$plage"

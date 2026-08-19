@@ -5,20 +5,33 @@
 set -uo pipefail
 f="${1:?usage: verifier-message.sh <fichier>}"
 corps="$(grep -v '^Co-Authored-By:' "$f" | grep -v '^#')"
+
+# CITER UN MOT N'EST PAS L'EMPLOYER. Les controles de STYLE portent sur le texte PRIVE de
+# ce qui est entre guillemets francais : sans cela, un message ne peut pas expliquer la
+# regle sans la violer — defaut rencontre trois fois, et deja corrige au meme titre sur une
+# garde qui matchait le commentaire la justifiant. Les controles d'IDENTIFIANTS et
+# d'ADRESSES, eux, restent sur le texte COMPLET : une adresse entre guillemets reste une
+# adresse publiee.
+style="$(printf '%s' "$corps" | sed 's/«[^»]*»//g')"
 fautes=""
 ajoute() { fautes="$fautes
   - $1"; }
 
 # ── STYLE : le message raconte l'auteur au lieu de decrire le changement ────────────────
+# PROPRIETE VISEE : le message se raconte a la premiere personne du SINGULIER. « nous »
+# et « notre » en sont exclus DELIBEREMENT : mesure faite, ils n'attrapaient que des
+# CITATIONS du texte du produit et des tournures collectives (« notre code »), jamais un
+# auteur qui se raconte. Une garde qui les refuserait interdirait de decrire ce que le
+# code dit — le meme defaut qu'une garde qui matche le commentaire la justifiant.
 # Motifs ANCRES sur des frontieres de mot. Sans ancrage, « fichier » matchait « hier » —
 # mesure faussee avant correction, d'ou les frontieres explicites partout.
-if printf '%s' "$corps" | grep -qiE "\bj'(ai|avais|étais|etais)\b|\bje \b"; then
-  ajoute "recit a la premiere personne (« j'ai », « je ») — decrire le CHANGEMENT, pas son auteur"
+if printf '%s' "$style" | grep -qiE "\bj'(ai|avais|étais|etais)\b|\bje \b|\bmoi\b|\bmoi[- ]m[eê]me\b"; then
+  ajoute "recit a la premiere personne (« j'ai », « je », « moi », « moi-meme ») — decrire le CHANGEMENT, pas son auteur"
 fi
-if printf '%s' "$corps" | grep -qiE "\b(ma|mon|mes)\b +(faute|erreur|premier|premiere|hypothese|mesure|verdict|correctif|inquietude|rendement|regle|garde|script|boucle)"; then
+if printf '%s' "$style" | grep -qiE "\b(ma|mon|mes)\b +(faute|erreur|premier|premiere|hypothese|mesure|verdict|correctif|inquietude|rendement|regle|garde|script|boucle)"; then
   ajoute "possessif renvoyant a l'auteur (« ma faute », « mon correctif »)"
 fi
-if printf '%s' "$corps" | grep -qiE "\bhier\b|\baujourd'hui\b|\bce matin\b|de la (session|journee|journée)|\b[0-9ivx]+e fois (de|d')"; then
+if printf '%s' "$style" | grep -qiE "\bhier\b|\baujourd'hui\b|\bce matin\b|de la (session|journee|journée)|\b[0-9ivx]+e fois (de|d')"; then
   ajoute "repere de session (« hier », « de la journee », « 4e fois de la session »)"
 fi
 # ── DESTINATAIRE : le message s'adresse a quelqu'un ou cite un echange prive ────────────

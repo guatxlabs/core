@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+_r="$(git rev-parse --show-toplevel)"
+"$_r/.github/scripts/verifier-identite.sh" --index || exit 1
 # GARDE D'IDENTITÉ PUBLIQUE — copie EXTRAITE du hook de plume (même défaut, même remède).
 # `core` est publié sous guatxlabs ; l'identité git GLOBALE de la machine de dev est un
 # compte personnel, dont tout clone frais hérite. Le `.mailmap` répare l'affichage, cette
