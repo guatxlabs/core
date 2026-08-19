@@ -17,6 +17,14 @@ git config core.hooksPath .githooks     # arme les gardes
 
 `.githooks/pre-commit` refuse un commit dont l'auteur n'est pas celui-là.
 
+**AUCUN TRAILER `Co-Authored-By`.** GitHub ne construit pas la page Contributors a partir du
+seul auteur : il compte aussi ces trailers sur la branche par defaut, et il apparie par
+ADRESSE. Un seul trailer suffit a faire figurer un compte de plus comme contributeur du
+projet. Ce depot n'affiche qu'une identite, celle qui engage sa responsabilite sur le code.
+Le verificateur refuse le trailer, et il lit le FICHIER du message et non le corps nettoye —
+ce corps retire deja ces lignes, donc une garde qui le lirait ne pourrait jamais rien
+trouver et rendrait vert en etant aveugle.
+
 ## 2. Écrire pour le lecteur du code — jamais pour une personne
 
 Un message de commit dit **ce qui change et pourquoi**. Il ne raconte pas le déroulement du
