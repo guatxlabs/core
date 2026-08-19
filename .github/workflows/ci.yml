@@ -116,8 +116,29 @@ jobs:
         with:
           toolchain: "1.96.0"
 
-      - name: Install cargo-audit (version épinglée)
-        run: cargo install cargo-audit --locked --version 0.21.2
+      # VERSION ÉPINGLÉE. Elle l'était déjà — à 0.21.2 — et c'est précisément CETTE version qui
+      # cassait la porte, par un ÉCHEC AU CHARGEMENT et non par un findings de plus.
+      #
+      # `--locked` fait construire cargo-audit avec SON Cargo.lock, donc avec une version FIGÉE de la
+      # crate `cvss` qui analyse les scores de la base d'avis. Mesuré le 2026-08-19 (Cargo.lock des
+      # .crate publiés) : cargo-audit 0.21.2 verrouille cvss 2.0.0, dont `src/` n'a QUE le module
+      # `v3` ; cvss 2.1.0+ ajoute `v4`, et 0.22.0/0.22.1/0.22.2 verrouillent tous cvss 2.2.0. Face à
+      # une advisory notée en CVSS 4.0 — RUSTSEC-2026-0066 (astral-tokio-tar), entrée dans la base le
+      # 2026-03-17 — cvss 2.0.0 rend `unsupported CVSS version: 4.0` PENDANT le chargement de la
+      # base : l'outil n'atteint alors NI une éventuelle liste d'ignore NI le scan, et aucun
+      # correctif de vulnérabilité ne pourrait rendre ce job vert. 0.22.2 charge les 1217 advisories
+      # et scanne les 18 deps de ce crate (mesuré).
+      #
+      # POUR RELEVER cette version, deux conditions à VÉRIFIER, pas à supposer :
+      #   1. le Cargo.lock de la release visée épingle cvss >= 2.1.0 (sinon retour du même mur) ;
+      #   2. son `rust-version` est <= la toolchain épinglée ci-dessus (0.22.2 exige 1.88 ; 1.96.0 OK).
+      #
+      # La base d'avis (advisory-db), elle, n'est VOLONTAIREMENT pas épinglée : la figer rendrait
+      # cette porte aveugle à toute advisory publiée après la révision choisie — ce serait désarmer
+      # le contrôle. On épingle l'OUTIL (son comportement doit être reproductible), pas la BASE
+      # (son contenu doit être frais).
+      - name: Install cargo-audit (version épinglée — lit le CVSS 4.0)
+        run: cargo install cargo-audit --locked --version 0.22.2
 
       - name: cargo audit (deny warnings)
         run: cargo audit --deny warnings
