@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Delegue au MEME verificateur que la CI. Une regle ecrite deux fois finit par diverger :
+# le hook est la boucle de retour rapide, la CI est l'application qui ne se contourne pas.
+set -euo pipefail
+racine="$(git rev-parse --show-toplevel)"
+exec "$racine/.github/scripts/verifier-message-de-commit.sh" "$1"

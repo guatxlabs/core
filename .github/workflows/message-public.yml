@@ -1,0 +1,40 @@
+# Un message de commit s'adresse au lecteur du code. Le hook local le rappelle, mais il se
+# contourne (`--no-verify`) et se perd a chaque clone frais : cette verification-ci est celle
+# qui LIE. Elle rejoue le MEME script que le hook, sur la plage reellement poussee.
+name: message-public
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+jobs:
+  verifier:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verifier chaque message de la plage poussee
+        env:
+          AVANT: ${{ github.event.before }}
+        run: |
+          set -uo pipefail
+          # PLAGE DERIVEE, pas devinee : au premier push (ou apres un force-push) `before` vaut
+          # la valeur nulle — on retombe alors sur le seul HEAD plutot que de tout rejouer.
+          NUL=0000000000000000000000000000000000000000
+          if [ -z "${AVANT:-}" ] || [ "$AVANT" = "$NUL" ] || ! git cat-file -e "$AVANT^{commit}" 2>/dev/null; then
+            PLAGE="$(git rev-parse HEAD)"
+          else
+            PLAGE="$(git rev-list "$AVANT..HEAD")"
+          fi
+          n=0; ko=0
+          for h in $PLAGE; do
+            git log -1 --format=%B "$h" > /tmp/msg
+            if ! ./.github/scripts/verifier-message-de-commit.sh /tmp/msg 2> /tmp/err; then
+              echo "::error::$(git log -1 --format='%h %s' "$h")"
+              sed 's/^/    /' /tmp/err
+              ko=$((ko+1))
+            fi
+            n=$((n+1))
+          done
+          echo "messages verifies : $n · refuses : $ko"
+          [ "$ko" -eq 0 ]
