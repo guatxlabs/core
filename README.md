@@ -120,6 +120,20 @@ Aucune entrée n'y est jetée, donc une liste demandée ne peut pas s'évaporer 
 SQL invalide. Mesuré, refusé partout où le séparateur est la **virgule seule** : `by`, `by ,`,
 `by ,src_ip`, `by src_ip,`, `by src_ip,,host`, `fields`, `fields ,`, `fields ,src_ip`, `dedup ,src_ip`.
 
+**Un nom dans `by` doit être en portée** (`field_in_scope`, même porte pour `stats by`, `timechart by`,
+`eventstats by`). Le critère est dérivé de la résolution de champ : une colonne vivante (colonne réelle
+de la base, label déclaré par `metric … by <label>`, alias produit par une étape amont), un alias de
+knowledge object dont la source est vivante, ou une clé du sac JSON tant que le sac (`fields`) est encore
+en portée — les clés sont dynamiques, une clé absente groupe sous NULL. Tout autre nom est refusé en le
+nommant et en listant la portée. Ce que ce refus ferme, mesuré : `metric x | stats max(value) by date`
+compilait en `GROUP BY "date"` ; faute de colonne, SQLite lit `"date"` comme la chaîne littérale, toutes
+les lignes tombent sous un seul libellé et la requête rend UNE ligne dont la première colonne vaut
+« date » — un total déguisé en groupe. Même mécanique après un repli du sac : `… | stats count by src_ip
+| stats sum(count) by dport`. Le message oriente vers `timechart span=<durée>` quand le nom est un mot de
+calendrier (`date`, `hour`, …) : la tranche de temps existe dans le langage, c'est `timechart span=`,
+pas `by hour`. Limite connue : sur une base à sac JSON, `by date` reste une clé JSON plausible
+(`fields.date`) — indécidable à la compilation, la sortie montre alors une clé NULL, jamais le libellé.
+
 **Ce n'est pas une liste d'étapes, c'est une propriété vérifiée sur celles que le code déclare.** Une
 énumération écrite à la main avait déjà manqué une étape : `lookup … OUTPUT` découpait la chaîne
 elle-même, si bien que `lookup t k OUTPUT` et `lookup t k OUTPUT ,` compilaient en retombant sur la

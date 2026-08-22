@@ -2508,6 +2508,15 @@ AND lk.\"key\"=\"src_ip\"";
 
         for (sname, sch) in &schemas {
             let base = if *sname == "forge" { "runs" } else { "search" };
+            // LES NOMS SONDÉS SONT DES COLONNES DE LA BASE SONDÉE, lues dans le schéma : une liste de
+            // noms n'est reconnue qu'à condition de COMPILER, et `by` refuse un nom hors portée
+            // (`field_in_scope`). Sur `event`, `a,b` passait en clés du sac JSON ; sur une base sans
+            // sac (Forge), ces mêmes noms n'étaient que des libellés — c'est ce refus-là que la porte
+            // ferme, et le test ne doit pas en dépendre. Quatre colonnes projetées suffisent (toutes
+            // les bases livrées en ont davantage).
+            let base_cols: &[String] = if *sname == "forge" { &sch.alts[0].select_cols } else { &sch.default.select_cols };
+            assert!(base_cols.len() >= 4, "[{sname}] la base `{base}` projette moins de 4 colonnes : {base_cols:?}");
+            let (n1, n2, n3, n4) = (&base_cols[0], &base_cols[1], &base_cols[2], &base_cols[3]);
             let sql_of = |q: &str| to_sql(q, 0, 0, sch).ok();
             for (step, f) in &steps {
                 let body = fn_body(&allsrc, f);
@@ -2520,11 +2529,11 @@ AND lk.\"key\"=\"src_ip\"";
 
                 // (1) LA LISTE EST TOUT L'ARGUMENT — le préfixe est forcément vide.
                 if let (Some(x), Some(y)) = (
-                    sql_of(&format!("{base} | {step} a,b")),
-                    sql_of(&format!("{base} | {step} c,d")),
+                    sql_of(&format!("{base} | {step} {n1},{n2}")),
+                    sql_of(&format!("{base} | {step} {n3},{n4}")),
                 ) {
                     if x != y {
-                        let blank_sep = sql_of(&format!("{base} | {step} a b")).as_deref() == Some(x.as_str());
+                        let blank_sep = sql_of(&format!("{base} | {step} {n1} {n2}")).as_deref() == Some(x.as_str());
                         positions += 1;
                         let mut probes: Vec<String> = seps
                             .iter()
@@ -2547,8 +2556,8 @@ AND lk.\"key\"=\"src_ip\"";
                 for k in &kws {
                     for p in arg_prefixes() {
                         let (Some(x), Some(y)) = (
-                            sql_of(&format!("{base} | {step} {p} {k} a,b")),
-                            sql_of(&format!("{base} | {step} {p} {k} c,d")),
+                            sql_of(&format!("{base} | {step} {p} {k} {n1},{n2}")),
+                            sql_of(&format!("{base} | {step} {p} {k} {n3},{n4}")),
                         ) else {
                             continue;
                         };
@@ -2920,4 +2929,79 @@ AND lk.\"key\"=\"src_ip\"";
                 }
             }
         }
+    }
+
+    // --- `by` : UN NOM HORS PORTÉE EST REFUSÉ, JAMAIS PRIS POUR UN LIBELLÉ ------------------------
+    // Mesuré avant la porte : `metric x | stats max(value) by date` compilait en
+    // `SELECT "date" AS "date", MAX("value") … GROUP BY "date"` ; faute de colonne `date`, SQLite lit
+    // `"date"` comme la chaîne littérale — toutes les lignes sous un seul libellé, UNE ligne en sortie,
+    // première colonne « date ». Le critère de portée est `field_in_scope` (dérivé de `soql_field`).
+
+    #[test]
+    fn by_unknown_name_on_metric_is_refused_naming_the_field_and_the_scope() {
+        let ev = Schema::events();
+        let e = to_sql("metric mem_slab_mb | stats max(value) by date", 0, 0, &ev).expect_err("un libellé n'est pas une clé");
+        assert!(e.contains("« date »"), "le champ refusé est nommé : {e}");
+        assert!(e.contains("en portée : ts, host, value"), "la portée est listée : {e}");
+        assert!(e.contains("timechart span="), "un mot de calendrier oriente vers la tranche de temps : {e}");
+        // `by hour` : même refus, même orientation — c'est l'intention « par heure » du constat.
+        let e = to_sql("metric mem_slab_mb | stats max(value) by hour", 0, 0, &ev).expect_err("idem pour hour");
+        assert!(e.contains("« hour »") && e.contains("timechart span="), "{e}");
+        // Un nom hors portée qui n'est PAS un mot de calendrier : refus, orientation « label de métrique ».
+        let e = to_sql("metric http_requests_total | stats max(value) by code", 0, 0, &ev).expect_err("label non déclaré");
+        assert!(e.contains("« code »") && e.contains("metric <nom> by <label>"), "{e}");
+    }
+
+    #[test]
+    fn by_live_column_or_declared_label_on_metric_is_accepted() {
+        let ev = Schema::events();
+        let s = to_sql("metric mem_slab_mb | stats max(value) by host", 0, 0, &ev).unwrap();
+        assert!(s.contains("GROUP BY \"host\""), "{s}");
+        // Le label déclaré sur la base (`metric … by code`) est une colonne vivante -> accepté.
+        let s = to_sql("metric http_requests_total by code | stats max(value) by code", 0, 0, &ev).unwrap();
+        assert!(s.contains("GROUP BY \"code\""), "{s}");
+    }
+
+    #[test]
+    fn by_json_key_is_accepted_while_the_bag_is_in_scope_and_refused_after() {
+        let ev = Schema::events();
+        // Clé du sac JSON sur `event` : dynamique, acceptée tant que `fields` est en portée.
+        let s = to_sql("search | stats count by dport", 0, 0, &ev).unwrap();
+        assert!(s.contains("json_extract(fields,'$.dport')"), "{s}");
+        // Après une agrégation, le sac est replié : le même nom n'est plus qu'un libellé -> refus, et
+        // le message dit où grouper. Mesuré avant : `GROUP BY "dport"` sur le littéral.
+        let e = to_sql("search | stats count by src_ip | stats sum(count) by dport", 0, 0, &ev).expect_err("sac replié");
+        assert!(e.contains("« dport »") && e.contains("en portée : src_ip, count") && e.contains("première étape `stats`"), "{e}");
+        // L'alias d'une étape amont est vivant : accepté.
+        let s = to_sql("search | stats count by src_ip | stats sum(count) by src_ip", 0, 0, &ev).unwrap();
+        assert!(s.contains("GROUP BY \"src_ip\""), "{s}");
+        // Un alias de knowledge object suit sa SOURCE : en portée à la base, hors portée après le repli.
+        let mut ko = KnowledgeSet::new();
+        ko.add_alias("msg", "message");
+        let sch = Schema::events().with_knowledge(ko);
+        let s = to_sql("search | stats count by msg", 0, 0, &sch).unwrap();
+        assert!(s.contains("\"message\" AS \"msg\""), "{s}");
+        let e = to_sql("search | stats count by src_ip | stats sum(count) by msg", 0, 0, &sch).expect_err("source repliée");
+        assert!(e.contains("« msg »"), "{e}");
+    }
+
+    #[test]
+    fn by_scope_gate_is_the_same_door_for_timechart_and_eventstats() {
+        let ev = Schema::events();
+        let e = to_sql("metric mem_slab_mb | timechart avg(value) by date", 0, 0, &ev).expect_err("timechart by");
+        assert!(e.starts_with("timechart : champ inconnu dans `by` : « date »"), "{e}");
+        let e = to_sql("metric mem_slab_mb | eventstats max(value) by hour", 0, 0, &ev).expect_err("eventstats by");
+        assert!(e.starts_with("eventstats : champ inconnu dans `by` : « hour »"), "{e}");
+        // Et la forme que le langage offre pour « par heure » compile : une tranche par heure, par hôte.
+        let s = to_sql("metric mem_slab_mb | timechart span=1h max(value) by host", 0, 0, &ev).unwrap();
+        assert!(s.contains("(ts/3600)*3600 AS bucket") && s.contains("GROUP BY bucket,\"host\""), "{s}");
+    }
+
+    #[test]
+    #[cfg(feature = "forge")]
+    fn by_scope_gate_holds_on_a_base_without_json_bag() {
+        let s = to_sql("search | stats count by campaign", 0, 0, &forge()).unwrap();
+        assert!(s.contains("GROUP BY \"campaign\""), "{s}");
+        let e = to_sql("search | stats count by nope", 0, 0, &forge()).expect_err("aucun sac JSON : un nom inconnu est un libellé");
+        assert!(e.contains("« nope »") && e.contains("en portée : ts, campaign"), "{e}");
     }

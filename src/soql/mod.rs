@@ -1108,15 +1108,64 @@ pub fn compile_with_time(soql: &str, from: i64, to: i64, schema: &Schema) -> Res
 ///
 /// LA VALIDITÉ DE LA LISTE N'EST PAS DÉCIDÉE ICI : `FieldList::commas` la décide pour TOUTES les listes
 /// de champs séparées par des virgules (`by` des trois étapes d'ici + `metric ... by`, `fields`,
-/// `dedup`), cf. le bandeau de `helpers.rs`. Cette fonction ne fabrique plus que l'émission ; `label`
-/// est le préfixe d'erreur propre à l'étape.
+/// `dedup`), cf. le bandeau de `helpers.rs`. `label` est le préfixe d'erreur propre à l'étape.
+///
+/// LA PORTÉE DE CHAQUE NOM, EN REVANCHE, EST DÉCIDÉE ICI (`field_in_scope`). Une clé de groupe doit
+/// désigner quelque chose : sans cette porte, un nom hors portée traversait `soql_field` et ressortait
+/// en identifiant quoté (`"date"`) ; SQLite, faute de colonne de ce nom, le lit comme la CHAÎNE LITTÉRALE
+/// `'date'` (repli historique des identifiants à guillemets doubles) — `GROUP BY "date"` groupait alors
+/// toutes les lignes sous un seul libellé et rendait UNE ligne dont la première colonne valait « date ».
+/// Mesuré : `metric x | stats max(value) by date` ; même chemin pour `timechart … by` et `eventstats … by`.
+/// Un total déguisé en ligne est une détection fausse : on refuse, en nommant le champ et la portée.
 fn by_fields(raw: &str, label: &str, ocols: &[String], jf: Option<&str>, d: &dyn Dialect) -> Result<(Vec<String>, Vec<String>, String), String> {
     let fields: Vec<String> = FieldList::commas(raw)
         .map_err(|bad| format!("{label}champ invalide : {bad}"))?
         .into_vec();
+    if let Some(unknown) = fields.iter().find(|f| !field_in_scope(f, ocols, jf)) {
+        return Err(unknown_by_field_message(unknown, label, ocols, jf));
+    }
     let sel: Vec<String> = fields.iter().map(|f| format!("{} AS {}", soql_field(f, ocols, jf, d), soql_qid(f))).collect();
     let gcols = fields.iter().map(|f| soql_qid(f)).collect::<Vec<_>>().join(",");
     Ok((fields, sel, gcols))
+}
+
+/// LE CRITÈRE « NOM DE CHAMP VALIDE DANS `by` » — dérivé de la résolution de `soql_field`, pas énuméré.
+/// Un nom est en portée si `soql_field` peut le résoudre vers AUTRE CHOSE qu'un identifiant nu :
+///  - une colonne VIVANTE : colonne réelle de la base (`event`, `metric` : `ts`, `host`, `value` et les
+///    labels déclarés par `metric … by <label>`), ou alias produit par une étape amont (`stats`, `eval`,
+///    `rename`, `rex`, `lookup … OUTPUT`, `top`) ;
+///  - un ALIAS de knowledge object dont la source est une colonne vivante ;
+///  - une CLÉ du sac JSON, quand le sac (`fields`) est encore en portée : les clés sont dynamiques, on ne
+///    peut pas les connaître à la compilation — le nom est accepté, une clé absente groupe sous NULL.
+///
+/// Tout le reste (base sans sac JSON ; sac déjà replié par une agrégation ou écarté par une projection)
+/// est HORS PORTÉE : la résolution ne retomberait que sur l'identifiant nu, c'est-à-dire le libellé.
+fn field_in_scope(name: &str, cols: &[String], json_field: Option<&str>) -> bool {
+    if cols.iter().any(|c| c == name) {
+        return true;
+    }
+    let aliased = ko_alias(name);
+    let name = aliased.as_deref().unwrap_or(name);
+    cols.iter().any(|c| c == name) || json_field.is_some_and(|jf| cols.iter().any(|c| c == jf))
+}
+
+/// Message de refus d'un nom hors portée dans `by` : NOMME le champ, LISTE ce qui est en portée, et
+/// oriente vers ce que le langage offre pour l'intention la plus probable :
+///  - un mot de calendrier (`date`, `hour`, …) demande une tranche de temps : c'est `timechart span=` ;
+///  - un sac JSON replié : le champ se groupe à la première agrégation, pas après ;
+///  - une base métrique (colonnes `ts`,`host`,`value`, pas de sac) : un label se déclare sur la base.
+fn unknown_by_field_message(name: &str, label: &str, cols: &[String], json_field: Option<&str>) -> String {
+    const CALENDAR_WORDS: &[&str] = &["date", "day", "hour", "minute", "week", "month", "year", "time", "jour", "heure", "mois", "semaine"];
+    let in_scope = cols.join(", ");
+    let mut msg = format!("{label}champ inconnu dans `by` : « {name} » (en portée : {in_scope})");
+    if CALENDAR_WORDS.contains(&name.to_ascii_lowercase().as_str()) {
+        msg.push_str(" — pour grouper par tranche de temps : `timechart span=<durée> <agrégat> [by champ]` (ex. span=1h, span=1d)");
+    } else if json_field.is_some_and(|jf| !cols.iter().any(|c| c == jf)) {
+        msg.push_str(" — les champs JSON ne sont plus en portée après une agrégation ou une projection : grouper sur ce champ à la première étape `stats`, ou le garder via `fields`");
+    } else if json_field.is_none() && ["ts", "host", "value"].iter().all(|c| cols.iter().any(|k| k == c)) {
+        msg.push_str(" — un label de métrique se déclare sur la base : `metric <nom> by <label>`");
+    }
+    msg
 }
 // Compilateurs PAR ÉTAPE — déplacés dans le sous-module `stages`. `compile_depth` (le DISPATCHER) reste ici.
 
