@@ -887,6 +887,177 @@ AND lk.\"key\"=\"src_ip\"";
         assert!(to_sql("search hello", 0, 0, &Schema::events().with_masks(only_json)).is_ok(), "free-text OK si message non masqué");
     }
 
+    // --- LE SAC JSON PORTE UNE CLÉ MASQUÉE : aucune voie ne lit son texte BRUT ----------------------
+    // Forme du SQL émis (ces tests tournent partout). La preuve par EXÉCUTION — le résultat ne change pas
+    // avec la valeur de la clé masquée — est dans `tests/bag_oracle_masked_key.rs`.
+    const BAG_REDACTED: &str = "(CASE WHEN json_valid(\"fields\") THEN json_remove(\"fields\",'$.secret') ELSE NULL END)";
+
+    fn bag_sch() -> Schema {
+        Schema::events().with_masks(masks_of(&[("secret", MaskAction::Redact)]))
+    }
+
+    #[test]
+    fn bag_masked_key_base_predicates_are_refused() {
+        let mut ko = KnowledgeSet::new();
+        ko.add_alias("sac", "fields");
+        ko.add_eventtype("et_sac", "fields=*abc*");
+        ko.add_tag("t_sac", "fields", "{\"secret\":\"abc\"}");
+        let sch = || bag_sch().with_knowledge(ko.clone());
+        for q in [
+            "search fields=~\"abc\"",
+            "search fields:~abc",
+            "search fields=*abc*",
+            "search fields!=*abc*",
+            "search fields in ({\"secret\":\"abc\"})",
+            "search fields not in (x)",
+            "search fields=abc",
+            "search fields!=abc",
+            "search fields>{",
+            "search fields>5",
+            "search fields in (1, 2)",
+            "search sac=*abc*",
+            "search eventtype=et_sac",
+            "search tag=t_sac",
+            "search | append [search fields=*abc*]",
+            "search | join host [search fields=*abc* | stats count by host]",
+            "search | append [search | append [search | append [search fields=*abc*]]]",
+        ] {
+            let e = to_sql(q, 0, 0, &sch()).expect_err(q);
+            assert!(e.contains("sac « fields »") && e.contains("peut porter une valeur masquée"), "{q} : {e}");
+        }
+        // Un masque sur une colonne réelle suffit : le sac peut porter une clé de ce nom. Seul le jeu VIDE
+        // laisse le sac filtrable (mode 0).
+        let reel = Schema::events().with_masks(masks_of(&[("src_ip", MaskAction::Mask)]));
+        for q in ["search fields=*abc*", "search fields in (x)", "search fields=~\"abc\""] {
+            let e = to_sql(q, 0, 0, &reel).expect_err(q);
+            assert!(e.contains("peut porter une valeur masquée"), "colonne réelle masquée : {q} : {e}");
+            assert!(to_sql(q, 0, 0, &Schema::events()).is_ok(), "sans masque : {q}");
+        }
+        // Une clé du sac NON masquée reste filtrable.
+        assert!(to_sql("search other=abc", 0, 0, &bag_sch()).is_ok());
+    }
+
+    #[test]
+    fn bag_masked_key_group_by_uses_the_redacted_bag() {
+        // SQLite résout un nom de GROUP BY vers la colonne d'ENTRÉE : `GROUP BY "fields"` groupait sur le sac brut.
+        for (q, groupe) in [
+            ("search | stats count by fields", format!("GROUP BY {BAG_REDACTED}")),
+            ("search | stats count by host, fields", format!("GROUP BY \"host\",{BAG_REDACTED}")),
+            ("search | top fields", format!("GROUP BY {BAG_REDACTED} ORDER BY count DESC")),
+            ("search | rare fields", format!("GROUP BY {BAG_REDACTED} ORDER BY count ASC")),
+            ("search | timechart span=1h count by fields", format!("GROUP BY bucket,{BAG_REDACTED}")),
+        ] {
+            let sql = to_sql(q, 0, 0, &bag_sch()).unwrap();
+            assert!(sql.contains(&groupe), "{q} : groupe attendu {groupe}\n{sql}");
+            assert!(!sql.contains("GROUP BY \"fields\"") && !sql.contains(",\"fields\" ORDER"), "{q} : {sql}");
+        }
+        // Mode 0 : le nom quoté, à l'octet.
+        let plain = to_sql("search | stats count by fields", 0, 0, &Schema::events()).unwrap();
+        assert!(plain.ends_with("GROUP BY \"fields\""), "{plain}");
+    }
+
+    #[test]
+    fn bag_masked_key_group_by_case_variant_is_not_resolved_to_the_raw_bag() {
+        // Un nom de groupe qui ne diffère du sac que par la casse, NON vivant : `GROUP BY "FIELDS"` serait
+        // résolu par SQLite vers la colonne d'entrée `fields` (sac brut). On groupe sur l'expression projetée.
+        let key = "json_extract(fields,'$.FIELDS')";
+        for (q, groupe) in [
+            ("search | stats count by FIELDS", format!("GROUP BY {key}")),
+            ("search | stats count by host, FIELDS", format!("GROUP BY \"host\",{key}")),
+            ("search | top FIELDS", format!("GROUP BY {key} ORDER BY count DESC")),
+            ("search | rare FIELDS", format!("GROUP BY {key} ORDER BY count ASC")),
+            ("search | timechart span=1h count by FIELDS", format!("GROUP BY bucket,{key}")),
+        ] {
+            let sql = to_sql(q, 0, 0, &bag_sch()).unwrap();
+            assert!(sql.contains(&groupe), "{q} : groupe attendu {groupe}\n{sql}");
+            assert!(!sql.contains("\"FIELDS\" ORDER") && !sql.ends_with("GROUP BY \"FIELDS\""), "{q} : {sql}");
+        }
+        // Alias de savoir qui ne diffère du sac que par la casse : vers le sac -> sac caviardé ; vers une
+        // colonne -> la colonne.
+        let mut ko = KnowledgeSet::new();
+        ko.add_alias("FIELDS", "fields");
+        ko.add_alias("Fields", "host");
+        let sch = bag_sch().with_knowledge(ko);
+        let sql = to_sql("search | stats count by FIELDS", 0, 0, &sch).unwrap();
+        assert!(sql.ends_with(&format!("GROUP BY {BAG_REDACTED}")), "{sql}");
+        let sql = to_sql("search | top Fields", 0, 0, &sch).unwrap();
+        assert!(sql.contains("GROUP BY \"host\" ORDER BY"), "{sql}");
+        // Mode 0 : le nom quoté, à l'octet.
+        let plain = to_sql("search | stats count by FIELDS", 0, 0, &Schema::events()).unwrap();
+        assert!(plain.ends_with("GROUP BY \"FIELDS\""), "{plain}");
+    }
+
+    #[test]
+    fn bag_masked_key_refused_with_a_mixed_mask_set() {
+        // Il suffit qu'UNE clé du sac soit masquée, même à côté d'une colonne réelle masquée.
+        let mixte = Schema::events().with_masks(masks_of(&[("secret", MaskAction::Redact), ("src_ip", MaskAction::Mask)]));
+        for q in ["search fields=*abc*", "search fields=~\"abc\"", "search fields in (x)", "search | join fields [search]"] {
+            let e = to_sql(q, 0, 0, &mixte).expect_err(q);
+            assert!(e.contains("peut porter une valeur masquée"), "{q} : {e}");
+        }
+        let sql = to_sql("search | stats count by fields", 0, 0, &mixte).unwrap();
+        assert!(sql.contains("GROUP BY (CASE WHEN json_valid(\"fields\")"), "{sql}");
+    }
+
+    #[test]
+    fn bag_masked_key_partitions_and_join() {
+        // eventstats values/list : sous-requête corrélée, partition caviardée des deux côtés.
+        let sql = to_sql("search | eventstats values(ts) by fields", 0, 0, &bag_sch()).unwrap();
+        assert!(sql.contains("json_remove(i.\"fields\",'$.secret')") && sql.contains("json_remove(o.\"fields\",'$.secret')"), "{sql}");
+        assert!(!sql.contains("i.\"fields\" IS o.\"fields\""), "{sql}");
+        // rate : la partition de fenêtre porte le sac caviardé.
+        let sql = to_sql("search | eval value = ts | rate", 0, 0, &bag_sch()).unwrap();
+        let w = &sql[sql.find("WINDOW w AS (PARTITION BY").expect("fenêtre")..];
+        assert!(w.contains(BAG_REDACTED) && !w.contains(",\"fields\","), "{w}");
+        // join sur le sac : refus nommé (le caviardage n'est pas exprimable dans USING).
+        let e = to_sql("search | join fields [search]", 0, 0, &bag_sch()).expect_err("join sur le sac");
+        assert!(e.contains("peut porter une valeur masquée"), "{e}");
+        assert!(to_sql("search | join fields [search]", 0, 0, &Schema::events()).is_ok(), "mode 0");
+        // rex lit le sac caviardé.
+        let sql = to_sql("search | rex fields \"(?<x>abc)\"", 0, 0, &bag_sch()).unwrap();
+        assert!(sql.contains(&format!("re_cap({BAG_REDACTED},")), "{sql}");
+    }
+
+    #[test]
+    fn bag_redacts_a_masked_real_column_name_live_or_not() {
+        // Le sac est écrit par le producteur : il peut porter `src_ip` avec la valeur que le masque de la
+        // colonne cache. Le nom est retiré du sac que la colonne soit vivante ou non.
+        let reel = Schema::events().with_masks(masks_of(&[("src_ip", MaskAction::Mask)]));
+        let redacted = "(CASE WHEN json_valid(\"fields\") THEN json_remove(\"fields\",'$.src_ip') ELSE NULL END)";
+        for q in ["search", "search | table src_ip, fields", "search | table ts, fields", "search | sort fields | table ts, src_ip, fields"] {
+            let sql = to_sql(q, 0, 0, &reel).unwrap();
+            assert!(sql.contains(&format!("{redacted} AS \"fields\"")), "{q} : {sql}");
+        }
+        let sql = to_sql("search | stats count by fields", 0, 0, &reel).unwrap();
+        assert!(sql.contains(&format!("GROUP BY {redacted}")) && !sql.contains("GROUP BY \"fields\""), "{sql}");
+        let e = to_sql("search | join fields [search]", 0, 0, &reel).expect_err("join sur le sac");
+        assert!(e.contains("peut porter une valeur masquée"), "{e}");
+        // Mode 0 (jeu vide) : sac brut, à l'octet.
+        let plain = to_sql("search | table src_ip, fields", 0, 0, &Schema::events()).unwrap();
+        assert!(!plain.contains("json_remove"), "{plain}");
+    }
+
+    #[test]
+    fn bag_masked_key_survives_aliases_that_shadow_it() {
+        // Un alias qui porte le NOM de la clé masquée ne fait pas d'elle une colonne : elle reste retirée du sac.
+        for q in ["search | eval secret = 1", "search | lookup lk host OUTPUT secret"] {
+            let sql = to_sql(q, 0, 0, &bag_sch()).unwrap();
+            assert!(sql.starts_with("SELECT \"ts\"") && sql.contains(&format!("{BAG_REDACTED} AS \"fields\"")), "{q} : {sql}");
+        }
+        let sql = to_sql("search | rename host AS secret | where fields=~\"abc\"", 0, 0, &bag_sch()).unwrap();
+        assert!(sql.contains(&format!("WHERE {BAG_REDACTED} REGEXP 'abc'")), "{sql}");
+        // Un alias qui ne diffère du sac que par la CASSE se résout, dans SQLite, vers le sac BRUT.
+        let sql = to_sql("search | eval FIELDS = 1", 0, 0, &bag_sch()).unwrap();
+        assert!(sql.contains(&format!("{BAG_REDACTED} AS \"FIELDS\"")), "{sql}");
+        let sql = to_sql("search | eval FIELDS = 1 | where FIELDS=~\"abc\"", 0, 0, &bag_sch()).unwrap();
+        assert!(sql.contains(&format!("WHERE {BAG_REDACTED} REGEXP 'abc'")), "{sql}");
+        let sql = to_sql("search | eval FIELDS = 1 | table FIELDS", 0, 0, &bag_sch()).unwrap();
+        assert!(sql.contains(&format!("SELECT {BAG_REDACTED} AS \"FIELDS\" FROM")), "{sql}");
+        // Une variante de casse NON vivante reste une clé du sac (json_extract), comme avant.
+        let sql = to_sql("search | table FIELDS", 0, 0, &bag_sch()).unwrap();
+        assert!(sql.contains("json_extract(fields,'$.FIELDS')"), "{sql}");
+    }
+
     #[test]
     fn field_mask_eval_fields_bag_cannot_escape() {
         // Mask bypass sur le chemin SQLite LIVE : le SAC JSON `fields` est gardé BRUT à la base

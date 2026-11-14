@@ -258,7 +258,11 @@ pub(crate) fn compile_top(toks: &[&str], mut sql: String, mut ocols: Vec<String>
     let dir = if toks[0] == "top" { "DESC" } else { "ASC" };
     let fexpr = soql_field(field, &ocols, jf, d);
     let qfield = soql_qid(field);
-    sql = format!("SELECT {fexpr} AS {qfield},COUNT(*) AS count FROM ({sql}) GROUP BY {qfield} ORDER BY count {dir} LIMIT {n}");
+    // FIELD FILTERS : `GROUP BY "fields"` (ou une variante de casse) se résout vers le sac BRUT d'entrée
+    // (cf. `by_fields`) -> on groupe sur l'expression projetée. Jeu de masques vide -> nom quoté,
+    // identique au legacy (mode 0).
+    let gkey = bag_group_key(field, &fexpr, &ocols, jf).unwrap_or_else(|| qfield.clone());
+    sql = format!("SELECT {fexpr} AS {qfield},COUNT(*) AS count FROM ({sql}) GROUP BY {gkey} ORDER BY count {dir} LIMIT {n}");
     ocols = vec![field.to_string(), "count".to_string()];
     Ok((sql, ocols))
 }
@@ -310,8 +314,16 @@ pub(crate) fn compile_eventstats(toks: &[&str], mut sql: String, mut ocols: Vec<
     Ok((sql, ocols))
 }
 
-pub(crate) fn compile_rate(mut sql: String, mut ocols: Vec<String>) -> Result<(String, Vec<String>), String> {
-    let partcols: Vec<String> = ocols.iter().filter(|c| *c != "ts" && *c != "value").map(|c| soql_qid(c)).collect();
+pub(crate) fn compile_rate(mut sql: String, mut ocols: Vec<String>, jf: Option<&str>) -> Result<(String, Vec<String>), String> {
+    // FIELD FILTERS : la partition porte sur TOUTES les colonnes vivantes, sac compris ; partitionner sur le
+    // sac BRUT rendait `rate` non NULL exactement quand deux lignes portaient la même valeur d'une clé
+    // masquée. Le sac (et un alias qui n'en diffère que par la casse) entre caviardé dans la partition.
+    // Jeu de masques vide -> nom quoté, identique au legacy (mode 0).
+    let partcols: Vec<String> = ocols
+        .iter()
+        .filter(|c| *c != "ts" && *c != "value")
+        .map(|c| bag_ref(c, &ocols, jf, None).unwrap_or_else(|| soql_qid(c)))
+        .collect();
     let win = if partcols.is_empty() {
         "ORDER BY ts".to_string()
     } else {
@@ -367,12 +379,19 @@ pub(crate) fn compile_append(stage: &str, mut sql: String, mut ocols: Vec<String
     Ok((sql, ocols))
 }
 
-pub(crate) fn compile_join(stage: &str, mut sql: String, mut ocols: Vec<String>, from: i64, to: i64, depth: u32, schema: &Schema) -> Result<(String, Vec<String>), String> {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compile_join(stage: &str, mut sql: String, mut ocols: Vec<String>, jf: Option<&str>, from: i64, to: i64, depth: u32, schema: &Schema) -> Result<(String, Vec<String>), String> {
     let d = schema.dialect;
     let after = stage.strip_prefix("join").unwrap_or("").trim_start();
     let field = after.split(|c: char| c.is_whitespace() || c == '[').next().unwrap_or("").trim();
     if !soql_ident_ok(field) {
         return Err(format!("join : champ invalide : {field}"));
+    }
+    // FIELD FILTERS : `USING(<clé>)` compare la colonne NOMMÉE, sans expression possible : sur le sac, le
+    // côté gauche serait le blob BRUT, et la correspondance des lignes dépendrait d'une clé masquée. Le
+    // caviardage n'est pas exprimable dans `USING` -> refus nommé. Jeu de masques vide -> inchangé.
+    if bag_ref(field, &ocols, jf, None).is_some() {
+        return Err(format!("join : la clé « {field} » est le sac JSON ; un masque de champ est actif et le sac peut porter une valeur masquée (field-filter actif pour votre rôle : une jointure sur le sac lirait cette valeur)"));
     }
     let inner = soql_bracket(stage)?;
     let (sub_sql, sub_cols) = compile_depth(&inner, from, to, depth + 1, schema)?;

@@ -3,6 +3,17 @@
 //! Extrait mécaniquement de `soql.rs` (découpage en sous-modules) : PUR DÉPLACEMENT, aucune
 //! ligne de logique/SQL modifiée — seules des visibilités privées ont été relevées à `pub(crate)`
 //! pour rester joignables depuis le module parent. Comportement byte-identique (cf. `tests/plume_parity.rs`).
+//!
+//! LE SAC PEUT PORTER UNE VALEUR MASQUÉE dès que le jeu de masques de la compilation n'est pas vide
+//! (`bag_may_carry_masked_value`, seule décision du compilateur pour tout ce qui protège le sac : refus du
+//! prédicat de base, caviardage, clé de groupe, partition, taux, jointure, variantes de casse). Pourquoi :
+//! le sac est écrit tel que le producteur de l'événement le fournit, rien n'en retire une clé qui porte le
+//! nom d'une colonne réelle ; un sac peut donc porter `src_ip` avec la valeur même que le masque de la
+//! colonne cache. Tout nom du jeu de masques est une clé à retirer du sac, colonne réelle ou non, vivante
+//! dans la portée ou non (retirer une clé absente ne change rien). Le mode 0 est le jeu VIDE, et lui seul.
+//! COÛT : un appelant dont le jeu de masques n'est pas vide ne peut plus filtrer sur le texte brut du sac
+//! (il filtre par nom de clé, `search <clé>=…`), y compris tout appelant quand une règle de déni vaut pour
+//! tous les rôles.
 
 use super::*;
 
@@ -129,27 +140,63 @@ pub(crate) fn mask_wrap(base: &str, field: &str) -> Option<String> {
     })
 }
 
-/// Chemins JSON (`'$.<clé>'`) des champs MASQUÉS de la compilation courante qui sont des CLÉS DU SAC JSON
-/// (= pas une colonne réelle `cols`). Sert à CAVIARDER le sac `fields` projeté EN ENTIER (`search` nu ou
-/// `| table fields`) : sans ça, un rôle restreint lirait la valeur masquée en clair dans le blob brut. Clés
-/// déjà validées `soql_ident_ok` -> pas d'injection dans le chemin JSON.
-fn scope_json_key_paths(cols: &[String]) -> Vec<String> {
-    MASK_SCOPE.with(|c| {
-        c.borrow()
-            .map
-            .keys()
-            .filter(|k| !cols.iter().any(|c| c == *k))
-            .map(|k| format!("'$.{k}'"))
-            .collect()
-    })
+/// Chemins JSON (`'$.<clé>'`) de TOUS les noms du jeu de masques de la compilation courante. Sert à
+/// CAVIARDER le sac `fields` (`search` nu, `| table fields`, et tout ce qui le lit) : sans ça, un rôle
+/// restreint lirait la valeur masquée en clair dans le blob brut. Aucun nom n'est écarté, ni parce qu'il est
+/// une colonne réelle, ni parce qu'il est vivant dans la portée : le sac peut porter une clé de ce nom (cf.
+/// en-tête). Clés déjà validées `soql_ident_ok` -> pas d'injection dans le chemin JSON.
+fn scope_json_key_paths() -> Vec<String> {
+    MASK_SCOPE.with(|c| c.borrow().map.keys().map(|k| format!("'$.{k}'")).collect())
 }
 
-/// Enveloppe la projection du SAC JSON ENTIER (`fields`) : retire les clés masquées du blob (fail-closed —
-/// on RETIRE la clé plutôt que de la masquer, plus strict et sûr). JSON invalide -> NULL (jamais un blob
-/// brut illisible qui contiendrait la clé en texte). `None` si aucune clé JSON masquée -> blob inchangé
+/// TRUE si le sac peut porter une valeur masquée : le jeu de masques courant n'est pas vide (cf. en-tête du
+/// module). Faux en mode 0 (jeu vide : aucune émission ne change). Seule garde des comportements qui
+/// protègent le sac.
+pub(crate) fn bag_may_carry_masked_value() -> bool {
+    mask_active()
+}
+
+/// Expression CAVIARDÉE du sac quand `name` désigne la colonne du sac vivante dans `cols` : le sac lui-même,
+/// ou un alias d'étape qui n'en diffère que par la CASSE (`eval FIELDS = 1`) — SQLite résout les noms de
+/// colonne sans tenir compte de la casse, et un tel alias se résout vers la PREMIÈRE colonne de ce nom,
+/// c'est-à-dire le sac brut de la base. `qual` préfixe la référence (`i."fields"`, sous-requête corrélée).
+/// `None` : ce n'est pas le sac, ou le jeu de masques est vide (`bag_may_carry_masked_value`) ->
+/// l'appelant garde son émission historique à l'octet (mode 0).
+pub(crate) fn bag_ref(name: &str, cols: &[String], json_field: Option<&str>, qual: Option<&str>) -> Option<String> {
+    let jf = json_field?;
+    if !bag_may_carry_masked_value() || !name.eq_ignore_ascii_case(jf) || !cols.iter().any(|c| c == jf) {
+        return None;
+    }
+    if name != jf && !cols.iter().any(|c| c == name) {
+        return None; // variante de casse NON vivante : c'est une clé du sac, résolue par `json_extract`
+    }
+    let base = match qual {
+        Some(q) => format!("{q}.{}", soql_qid(jf)),
+        None => soql_qid(jf),
+    };
+    bag_wrap(&base)
+}
+
+/// Clé de GROUP BY d'un champ de groupe `name` projeté par `fexpr` (sa `soql_field`), quand `name` ne
+/// diffère du sac que par la CASSE (ou l'est). Dans un GROUP BY, SQLite résout un identifiant vers la colonne
+/// d'ENTRÉE avant l'alias de sortie, et sans tenir compte de la casse : `GROUP BY "FIELDS"` groupe sur le sac
+/// BRUT, que `FIELDS` soit le sac, un alias de savoir, ou une clé du sac lue par `json_extract`. Dès que le
+/// jeu de masques n'est pas vide, on groupe donc sur l'expression projetée elle-même. `None` : nom sans
+/// rapport avec le sac, ou jeu de masques vide -> l'appelant garde le nom quoté, à l'octet (mode 0).
+pub(crate) fn bag_group_key(name: &str, fexpr: &str, cols: &[String], json_field: Option<&str>) -> Option<String> {
+    let jf = json_field?;
+    if !bag_may_carry_masked_value() || !name.eq_ignore_ascii_case(jf) || !cols.iter().any(|c| c == jf) {
+        return None;
+    }
+    Some(fexpr.to_string())
+}
+
+/// Enveloppe la projection du SAC JSON ENTIER (`fields`) : retire du blob TOUS les noms masqués (fail-closed
+/// — on RETIRE la clé plutôt que de la masquer, plus strict et sûr). JSON invalide -> NULL (jamais un blob
+/// brut illisible qui contiendrait la clé en texte). `None` si le jeu de masques est vide -> blob inchangé
 /// (mode 0 byte-identique).
-pub(crate) fn bag_wrap(base: &str, cols: &[String]) -> Option<String> {
-    let paths = scope_json_key_paths(cols);
+pub(crate) fn bag_wrap(base: &str) -> Option<String> {
+    let paths = scope_json_key_paths();
     if paths.is_empty() {
         return None;
     }
@@ -175,9 +222,9 @@ pub(crate) fn base_proj_col(col: &str, json_field: Option<&str>, _cols: &[String
 
 /// FIELD FILTERS — caviardage du SAC JSON en SORTIE. Si les colonnes finales `ocols` contiennent le sac
 /// (`fields`) — cas `search` NU, `| head`, `| sort`, `| where` qui ne re-projettent pas via `soql_field` — et
-/// qu'il existe des clés JSON masquées, on RE-PROJETTE en retirant ces clés du blob. Les autres colonnes
-/// passent BRUTES (déjà masquées à la base / par `soql_field`) -> aucun double-masquage. VIDE / pas de sac en
-/// sortie -> `sql`/`ocols` INCHANGÉS (mode 0 byte-identique). Appliqué à chaque `compile_depth` (sous-requêtes
+/// que le jeu de masques n'est pas vide, on RE-PROJETTE en retirant du blob tous les noms masqués. Les
+/// autres colonnes passent BRUTES (déjà masquées à la base / par `soql_field`) -> aucun double-masquage.
+/// VIDE / pas de sac en sortie -> `sql`/`ocols` INCHANGÉS (mode 0 byte-identique). Appliqué à chaque `compile_depth` (sous-requêtes
 /// comprises) -> le blob brut ne fuit à aucune profondeur.
 pub(crate) fn mask_output_bag(sql: String, ocols: Vec<String>, schema: &Schema) -> (String, Vec<String>) {
     let jf = match schema.default.json_field.as_deref() {
@@ -187,13 +234,15 @@ pub(crate) fn mask_output_bag(sql: String, ocols: Vec<String>, schema: &Schema) 
     if !ocols.iter().any(|c| c == jf) {
         return (sql, ocols);
     }
-    let w = match bag_wrap(&soql_qid(jf), &ocols) {
+    let w = match bag_wrap(&soql_qid(jf)) {
         Some(w) => w,
-        None => return (sql, ocols), // aucune clé JSON masquée -> blob inchangé
+        None => return (sql, ocols), // jeu de masques vide -> blob inchangé
     };
+    // Une colonne de sortie qui ne diffère du sac que par la CASSE (alias `FIELDS`) se résout, dans SQLite,
+    // vers le sac BRUT (première colonne de ce nom) : elle est caviardée comme le sac.
     let proj: Vec<String> = ocols
         .iter()
-        .map(|c| if c == jf { format!("{w} AS {}", soql_qid(c)) } else { soql_qid(c) })
+        .map(|c| if c.eq_ignore_ascii_case(jf) { format!("{w} AS {}", soql_qid(c)) } else { soql_qid(c) })
         .collect();
     (format!("SELECT {} FROM ({sql})", proj.join(",")), ocols)
 }

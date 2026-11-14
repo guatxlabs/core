@@ -523,8 +523,13 @@ fn soql_field(name: &str, cols: &[String], json_field: Option<&str>, d: &dyn Dia
     if let Some(jf) = json_field {
         if name == jf && cols.iter().any(|c| c == jf) {
             let base = soql_qid(name);
-            return bag_wrap(&base, cols).unwrap_or(base);
+            return bag_wrap(&base).unwrap_or(base);
         }
+    }
+    // Un alias qui ne diffère du sac que par la casse se résout, dans SQLite, vers le sac brut : caviardé
+    // comme lui dès que le jeu de masques n'est pas vide (`bag_ref`). Sinon -> résolution normale (mode 0).
+    if let Some(w) = bag_ref(name, cols, json_field, None) {
+        return w;
     }
     if cols.iter().any(|c| c == name) {
         // COLONNE RÉELLE : déjà masquée à la projection de BASE (`base_proj_col`) une seule fois -> renvoyée
@@ -555,6 +560,11 @@ fn soql_field(name: &str, cols: &[String], json_field: Option<&str>, d: &dyn Dia
 fn soql_field_qual(name: &str, cols: &[String], json_field: Option<&str>, d: &dyn Dialect, qual: &str) -> String {
     let aliased = if cols.iter().any(|c| c == name) { None } else { ko_alias(name) };
     let name = aliased.as_deref().unwrap_or(name);
+    // FIELD FILTERS : partition sur le SAC -> sac CAVIARDÉ des deux côtés (comme `soql_field`), sinon la
+    // partition se ferait sur le blob brut et son agrégat distinguerait les valeurs d'une clé masquée.
+    if let Some(w) = bag_ref(name, cols, json_field, Some(qual)) {
+        return w;
+    }
     if cols.iter().any(|c| c == name) {
         format!("{qual}.{}", soql_qid(name))
     } else if let Some(jf) = json_field {
@@ -588,6 +598,15 @@ fn soql_filter_field(name: &str, numeric: bool, base: &BaseDef, d: &dyn Dialect)
     // SONDER). VIDE (mode 0 / champ non masqué) -> aucune erreur -> WHERE byte-identique au legacy.
     if mask_for(name).is_some() {
         return Err(format!("filtrage interdit sur le champ masqué « {name} » (field-filter actif pour votre rôle : un champ que vous ne pouvez pas voir ne peut pas être filtré)"));
+    }
+    // MÊME ORACLE PAR LE SAC : le sac JSON (`fields`) est une colonne réelle, son texte BRUT contient chaque
+    // clé masquée et sa valeur en clair. Un prédicat de base sur le sac (`=~`, joker, `in`, égalité,
+    // comparaison — tous passent ici) sonderait donc la clé masquée aussi sûrement qu'un filtre direct.
+    // Refus dès que le jeu de masques n'est pas vide : le sac peut porter une clé au nom de n'importe quel
+    // champ masqué, colonne réelle comprise (cf. en-tête de `mask`). Jeu vide -> aucune erreur -> WHERE
+    // byte-identique au legacy.
+    if base.json_field.as_deref() == Some(name) && bag_may_carry_masked_value() {
+        return Err(format!("filtrage interdit sur le sac « {name} » : un masque de champ est actif et le sac peut porter une valeur masquée (field-filter actif pour votre rôle : un champ que vous ne pouvez pas voir ne peut pas être filtré, même à travers le sac ; filtrer par nom de clé)"));
     }
     Ok(if base.real_cols.iter().any(|c| c == name) {
         soql_qid(name)
@@ -1124,8 +1143,19 @@ fn by_fields(raw: &str, label: &str, ocols: &[String], jf: Option<&str>, d: &dyn
     if let Some(unknown) = fields.iter().find(|f| !field_in_scope(f, ocols, jf)) {
         return Err(unknown_by_field_message(unknown, label, ocols, jf));
     }
-    let sel: Vec<String> = fields.iter().map(|f| format!("{} AS {}", soql_field(f, ocols, jf, d), soql_qid(f))).collect();
-    let gcols = fields.iter().map(|f| soql_qid(f)).collect::<Vec<_>>().join(",");
+    let exprs: Vec<String> = fields.iter().map(|f| soql_field(f, ocols, jf, d)).collect();
+    let sel: Vec<String> = fields.iter().zip(&exprs).map(|(f, e)| format!("{e} AS {}", soql_qid(f))).collect();
+    // FIELD FILTERS : dans un GROUP BY, SQLite résout un nom vers la colonne d'ENTRÉE avant l'alias de
+    // sortie, sans tenir compte de la casse. `GROUP BY "fields"` (ou `"FIELDS"`, vivant ou non) groupait donc
+    // sur le sac BRUT alors que la projection le caviarde ou lit une autre clé : le nombre de groupes
+    // distinguait les valeurs d'une clé masquée. On groupe sur l'expression projetée (`bag_group_key`).
+    // Jeu de masques vide -> nom quoté, identique au legacy (mode 0).
+    let gcols = fields
+        .iter()
+        .zip(&exprs)
+        .map(|(f, e)| bag_group_key(f, e, ocols, jf).unwrap_or_else(|| soql_qid(f)))
+        .collect::<Vec<_>>()
+        .join(",");
     Ok((fields, sel, gcols))
 }
 
@@ -1343,10 +1373,10 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
             "dedup" => compile_dedup(&toks, sql, ocols, jf, d)?,
             "top" | "rare" => compile_top(&toks, sql, ocols, jf, d)?,
             "eventstats" => compile_eventstats(&toks, sql, ocols, jf, d)?,
-            "rate" => compile_rate(sql, ocols)?,
+            "rate" => compile_rate(sql, ocols, jf)?,
             "eval" => compile_eval(stage, sql, ocols, jf, d)?,
             "append" => compile_append(stage, sql, ocols, from, to, depth, schema)?,
-            "join" => compile_join(stage, sql, ocols, from, to, depth, schema)?,
+            "join" => compile_join(stage, sql, ocols, jf, from, to, depth, schema)?,
             "mvexpand" => compile_mvexpand(&toks, sql, ocols, jf, d)?,
             "lookup" => compile_lookup(&toks, sql, ocols, jf, d)?,
             other => return Err(format!("commande GXQL inconnue : '{other}'")),

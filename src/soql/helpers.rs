@@ -757,7 +757,7 @@ pub(crate) fn soql_expr_sql(expr: &str, json_field: Option<&str>, cols: &[String
                 //    json_extract ne s'ACTIVE que lorsqu'un masque existe, donc jamais en mode 0.
                 match json_field {
                     Some(jf) if id.eq_ignore_ascii_case(jf) && cols.iter().any(|c| c.eq_ignore_ascii_case(jf)) => {
-                        out.push_str(&bag_wrap(&soql_qid(jf), cols).unwrap_or_else(|| id.clone()));
+                        out.push_str(&bag_wrap(&soql_qid(jf)).unwrap_or_else(|| id.clone()));
                     }
                     _ if cols.iter().any(|c| *c == id) => out.push_str(&id),
                     Some(jf) if mask_active() && cols.iter().any(|c| c == jf) => {

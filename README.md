@@ -134,6 +134,17 @@ calendrier (`date`, `hour`, …) : la tranche de temps existe dans le langage, c
 pas `by hour`. Limite connue : sur une base à sac JSON, `by date` reste une clé JSON plausible
 (`fields.date`) — indécidable à la compilation, la sortie montre alors une clé NULL, jamais le libellé.
 
+**Sous un masque de champ, le sac JSON n'est jamais lu brut** (`bag_may_carry_masked_value`, une seule
+décision pour tout le compilateur). Le sac (`fields`) est écrit tel que le producteur de l'événement le
+fournit : il peut porter une clé de n'importe quel nom, y compris celui d'une colonne réelle. Dès que le
+jeu de masques de l'appelant n'est pas vide, toute lecture du sac retire donc chaque nom masqué — en
+sortie, dans une expression, comme clé de groupe, de partition ou de tri, et pour un alias qui n'en diffère
+que par la casse — et ce qui ne peut pas lire un sac caviardé est refusé en le disant : un prédicat de base
+sur le sac (`search fields=…`, joker, expression régulière, `in`) et une jointure dont la clé est le sac.
+Coût assumé : un appelant masqué filtre par nom de clé (`search <clé>=…`), plus sur le texte du sac ; cela
+vaut pour tout appelant quand une règle de déni s'applique à tous les rôles. Sans aucun masque, le SQL
+émis est inchangé à l'octet.
+
 **Ce n'est pas une liste d'étapes, c'est une propriété vérifiée sur celles que le code déclare.** Une
 énumération écrite à la main avait déjà manqué une étape : `lookup … OUTPUT` découpait la chaîne
 elle-même, si bien que `lookup t k OUTPUT` et `lookup t k OUTPUT ,` compilaient en retombant sur la
