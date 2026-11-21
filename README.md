@@ -145,6 +145,20 @@ Coût assumé : un appelant masqué filtre par nom de clé (`search <clé>=…`)
 vaut pour tout appelant quand une règle de déni s'applique à tous les rôles. Sans aucun masque, le SQL
 émis est inchangé à l'octet.
 
+**Ce que le compilateur ne lit pas est refusé, jamais jeté ni lu de travers.** Trois familles de formes
+rendaient un résultat faux sans erreur ; elles sont refusées en disant quoi écrire, et aucune grammaire
+n'est ajoutée. *Le découpage en étapes respecte les guillemets doubles* : une barre verticale ou un crochet
+dans une valeur entre guillemets (`search url=~"/a|/b" | stats count`) n'est plus une frontière ; un
+guillemet non fermé est refusé. Dans une étape `rex`, et elle seule, `\"` est un guillemet du motif.
+*`search` relie ses termes par ET* : un `OR`, un `AND` ou un `NOT` nu et une parenthèse de groupement
+sont refusés (alternative : `champ in (a, b)` ou `champ=~"a|b"` ; négation : `champ!=valeur` ou
+`champ not in (…)` ; le mot ou la parenthèse comme texte : entre guillemets). *Une étape lit une grammaire
+fixe* : un second agrégat ou un alias dans `stats`, `eventstats` et `timechart` (`stats count as n` →
+`| rename count AS n`), un `BY` en majuscules, un argument en trop de `sort`, `head`, `top`, `rare`,
+`mvexpand`, `lookup`, `rate`, `append` ou `join` sont refusés en nommant le jeton. Coût assumé : un
+guillemet double isolé ne s'écrit plus hors d'un motif `rex` entre guillemets (dans une expression
+régulière : `\x22`). Sans aucune de ces formes, le SQL émis est inchangé à l'octet.
+
 **Ce n'est pas une liste d'étapes, c'est une propriété vérifiée sur celles que le code déclare.** Une
 énumération écrite à la main avait déjà manqué une étape : `lookup … OUTPUT` découpait la chaîne
 elle-même, si bien que `lookup t k OUTPUT` et `lookup t k OUTPUT ,` compilaient en retombant sur la

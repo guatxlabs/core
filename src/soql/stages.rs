@@ -13,8 +13,59 @@ use super::*;
 // émission n'a changé (invariant prouvé par `tests/plume_parity.rs`).
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// JETONS NON LUS — REFUSÉS EN LES NOMMANT.
+//
+// Chaque étape lit une grammaire fixe ; un jeton qu'elle ne lit pas était JETÉ sans un mot, et la
+// requête rendait autre chose que ce qui était écrit : `stats count dc(user) by host` rendait le seul
+// `count` (le second agrégat disparaissait), `stats count as n` une colonne `count`, `timechart count
+// dc(user)` le DERNIER agrégat, `sort count desc` un tri ascendant, `top 5 src_ip by host` un top
+// global. Ce qui est lu reste lu à l'identique ; ce qui ne l'est pas est refusé, avec la forme à écrire.
+// Aucune grammaire n'est ajoutée (un seul agrégat par étape, pas d'alias) : refuser ce qu'on ne lit
+// pas, c'est la seule réponse qui ne fabrique pas un résultat.
+// ---------------------------------------------------------------------------------------------
+
+/// Refus d'un ou plusieurs jetons qu'une étape ne lit pas. `why` dit ce qui est lu et la forme à écrire.
+fn refuse_unread(stage: &str, unread: &[&str], why: &str) -> Result<(), String> {
+    if unread.is_empty() {
+        return Ok(());
+    }
+    Err(format!("{stage} : jeton non lu : « {} » ({why})", unread.join(" ")))
+}
+
+/// Les jetons d'agrégat en trop de `stats`/`eventstats`/`timechart` : un alias (`as`) a son propre
+/// message, parce que la forme à écrire n'est pas la même (`rename`).
+fn refuse_extra_aggregate(stage: &str, read: &str, alias: &str, extra: &[&str], form: &str) -> Result<(), String> {
+    refuse_uppercase_by(stage, extra, form)?;
+    if extra.first().is_some_and(|t| t.eq_ignore_ascii_case("as")) {
+        return refuse_unread(
+            stage,
+            extra,
+            &format!("un alias n'est pas lu : la colonne de « {read} » s'appelle « {alias} » ; pour la renommer : `| rename {alias} AS <nom>`"),
+        );
+    }
+    refuse_unread(
+        stage,
+        extra,
+        &format!("un seul agrégat est lu, « {read} » ; forme : `{form}` — un second agrégat demande une seconde requête"),
+    )
+}
+
+/// `stats count BY host` : seul `by` en minuscules ouvre le regroupement. `BY host` tombait dans les
+/// jetons d'agrégat en trop (le regroupement était jeté, un total global rendu) ; le refus le dit, au
+/// lieu de parler d'un second agrégat.
+fn refuse_uppercase_by(stage: &str, unread: &[&str], form: &str) -> Result<(), String> {
+    match unread.iter().find(|t| t.eq_ignore_ascii_case("by")) {
+        Some(by) => refuse_unread(stage, unread, &format!("le regroupement s'écrit `by` en minuscules, « {by} » n'est pas lu ; forme : `{form}`")),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn compile_stats(toks: &[&str], mut sql: String, mut ocols: Vec<String>, jf: Option<&str>, d: &dyn Dialect) -> Result<(String, Vec<String>), String> {
-    let (aggsql, alias) = soql_agg(toks.get(1).copied().unwrap_or("count"), &ocols, jf, d)?;
+    let read = toks.get(1).copied().unwrap_or("count");
+    let (aggsql, alias) = soql_agg(read, &ocols, jf, d)?;
+    let head_end = toks.iter().position(|w| *w == "by").unwrap_or(toks.len());
+    refuse_extra_aggregate("stats", read, &alias, toks.get(2..head_end).unwrap_or(&[]), "stats <agrégat> [by champ1,champ2]")?;
     if let Some(bi) = toks.iter().position(|w| *w == "by") {
         let (fields, sel, gcols) = by_fields(&toks[bi + 1..].join(" "), "", &ocols, jf, d)?;
         sql = format!("SELECT {},{aggsql} AS {} FROM ({sql}) GROUP BY {gcols}", sel.join(","), soql_qid(&alias));
@@ -31,9 +82,16 @@ pub(crate) fn compile_timechart(toks: &[&str], mut sql: String, mut ocols: Vec<S
     let byi = toks.iter().position(|w| *w == "by");
     let head_end = byi.unwrap_or(toks.len());
     let mut span = 0i64;
-    let mut aggtok = "count";
+    let mut span_tok: Option<&str> = None;
+    let mut aggs: Vec<&str> = Vec::new();
     for t in &toks[1..head_end] {
         if let Some(s) = t.strip_prefix("span=") {
+            // Un second `span=` remplaçait le premier en silence : la fenêtre mesurée n'était pas l'une
+            // des deux demandées sans le dire. Refusé.
+            if let Some(first) = span_tok {
+                refuse_unread("timechart", &[t], &format!("un seul `span=` est lu, « {first} » ; forme : `timechart span=<durée> <agrégat> [by champ]`"))?;
+            }
+            span_tok = Some(t);
             span = soql_dur(s)?;
         } else if t.contains('=') {
             // S1 — FAIL-CLOSED. Seul le préfixe EXACT `span=` était reconnu ; tout autre jeton CONTENANT
@@ -46,8 +104,21 @@ pub(crate) fn compile_timechart(toks: &[&str], mut sql: String, mut ocols: Vec<S
                 "timechart : option inconnue : {t} (seul `span=<durée>` est supporté, ex: span=1h)"
             ));
         } else {
-            aggtok = t;
+            aggs.push(t);
         }
+    }
+    // Le DERNIER jeton qui n'est pas une option était lu, les précédents jetés : `timechart count
+    // dc(user)` rendait `dc`. Le jeton lu reste le même ; s'il y en a d'autres, refus.
+    let aggtok = aggs.last().copied().unwrap_or("count");
+    if aggs.len() > 1 {
+        const FORM: &str = "timechart [span=<durée>] <agrégat> [by champ]";
+        refuse_uppercase_by("timechart", &aggs, FORM)?;
+        if aggs[1].eq_ignore_ascii_case("as") {
+            // `count as n` : le jeton lu était le nom de l'alias. Le refus nomme l'agrégat écrit.
+            let alias = soql_agg(aggs[0], &ocols, jf, d).map(|(_, a)| a).unwrap_or_else(|_| aggs[0].to_string());
+            refuse_extra_aggregate("timechart", aggs[0], &alias, &aggs[1..], FORM)?;
+        }
+        refuse_unread("timechart", &aggs, &format!("un seul agrégat est lu ; forme : `{FORM}` — un second agrégat demande une seconde requête"))?;
     }
     if span <= 0 {
         let range = if to > from && from > 0 { to - from } else { 86400 };
@@ -130,12 +201,14 @@ pub(crate) fn compile_sort(toks: &[&str], mut sql: String, ocols: Vec<String>, j
     if !soql_ident_ok(field) {
         return Err(format!("sort : champ invalide : {field}"));
     }
+    refuse_unread("sort", toks.get(2..).unwrap_or(&[]), "un seul champ de tri est lu ; forme : `sort champ` (ascendant) ou `sort -champ` (descendant)")?;
     sql = format!("SELECT * FROM ({sql}) ORDER BY {} {dir}", soql_field(field, &ocols, jf, d));
     Ok((sql, ocols))
 }
 
 pub(crate) fn compile_head(toks: &[&str], mut sql: String, ocols: Vec<String>) -> Result<(String, Vec<String>), String> {
     let n: i64 = toks.get(1).copied().unwrap_or("20").parse().map_err(|_| "head/limit : nombre attendu".to_string())?;
+    refuse_unread(toks[0], toks.get(2..).unwrap_or(&[]), &format!("un seul nombre est lu ; forme : `{} N`", toks[0]))?;
     // CORE-3 : `LIMIT -N` -> SQLite interprète un LIMIT NÉGATIF comme ILLIMITÉ (aucune borne) -> un `head -5`
     // renverrait TOUTES les lignes au lieu d'en tronquer. On REJETTE le négatif (`head`/`limit` négatif n'a
     // pas de sens). `0` reste valide (`LIMIT 0` = 0 ligne, déjà sûr).
@@ -255,6 +328,7 @@ pub(crate) fn compile_top(toks: &[&str], mut sql: String, mut ocols: Vec<String>
     if !soql_ident_ok(field) {
         return Err(format!("{} : champ invalide : {field}", toks[0]));
     }
+    refuse_unread(toks[0], toks.get(idx + 1..).unwrap_or(&[]), &format!("un seul champ est lu, sans `by` ; forme : `{} [N] champ`", toks[0]))?;
     let dir = if toks[0] == "top" { "DESC" } else { "ASC" };
     let fexpr = soql_field(field, &ocols, jf, d);
     let qfield = soql_qid(field);
@@ -268,7 +342,10 @@ pub(crate) fn compile_top(toks: &[&str], mut sql: String, mut ocols: Vec<String>
 }
 
 pub(crate) fn compile_eventstats(toks: &[&str], mut sql: String, mut ocols: Vec<String>, jf: Option<&str>, d: &dyn Dialect) -> Result<(String, Vec<String>), String> {
-    let (aggsql, alias) = soql_agg(toks.get(1).copied().unwrap_or("count"), &ocols, jf, d)?;
+    let read = toks.get(1).copied().unwrap_or("count");
+    let (aggsql, alias) = soql_agg(read, &ocols, jf, d)?;
+    let head_end = toks.iter().position(|w| *w == "by").unwrap_or(toks.len());
+    refuse_extra_aggregate("eventstats", read, &alias, toks.get(2..head_end).unwrap_or(&[]), "eventstats <agrégat> [by champ1,champ2]")?;
     // Parse+validation `by` partagé (préfixe d'erreur « eventstats : ») -> noms de champ de partition.
     let fields: Vec<String> = if let Some(bi) = toks.iter().position(|w| *w == "by") {
         by_fields(&toks[bi + 1..].join(" "), "eventstats : ", &ocols, jf, d)?.0
@@ -314,7 +391,8 @@ pub(crate) fn compile_eventstats(toks: &[&str], mut sql: String, mut ocols: Vec<
     Ok((sql, ocols))
 }
 
-pub(crate) fn compile_rate(mut sql: String, mut ocols: Vec<String>, jf: Option<&str>) -> Result<(String, Vec<String>), String> {
+pub(crate) fn compile_rate(toks: &[&str], mut sql: String, mut ocols: Vec<String>, jf: Option<&str>) -> Result<(String, Vec<String>), String> {
+    refuse_unread("rate", toks.get(1..).unwrap_or(&[]), "`rate` ne lit aucun argument : il calcule le taux de `value` par série, sur toutes les colonnes vivantes ; forme : `rate`")?;
     // FIELD FILTERS : la partition porte sur TOUTES les colonnes vivantes, sac compris ; partitionner sur le
     // sac BRUT rendait `rate` non NULL exactement quand deux lignes portaient la même valeur d'une clé
     // masquée. Le sac (et un alias qui n'en diffère que par la casse) entre caviardé dans la partition.
@@ -363,8 +441,46 @@ pub(crate) fn compile_eval(stage: &str, mut sql: String, mut ocols: Vec<String>,
     Ok((sql, ocols))
 }
 
+/// `append`/`join` lisent la sous-recherche entre le PREMIER `[` et le DERNIER `]` (`soql_bracket`) :
+/// le texte écrit avant ou après était jeté (`join host max=0 [search …]`, `append [search …] x`).
+/// `rest` = le texte de l'étape après ce qu'elle a déjà lu (mot de commande, champ de jointure).
+///
+/// DEUX SOUS-RECHERCHES (`append [search a] [search b]`) : le texte entre le `]` qui ferme le premier
+/// `[` et le dernier `]` était lu DANS la sous-recherche (`a]`, `[search`, `b` en termes libres). Refusé
+/// aussi. Le crochet qui ferme le premier `[` se cherche en sautant le texte entre guillemets, comme le
+/// découpage en étapes (`search m="x]"` ne ferme rien).
+fn refuse_outside_brackets(stage: &str, rest: &str, why: &str) -> Result<(), String> {
+    let (Some(open), Some(close)) = (rest.find('['), rest.rfind(']')) else { return Ok(()) };
+    let (mut depth, mut quoted) = (0usize, false);
+    for (i, c) in rest[open..].char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            _ if quoted => {}
+            '[' => depth += 1,
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let first_close = open + i;
+                    if first_close != close {
+                        let between: Vec<&str> = rest[first_close + 1..close].split_whitespace().collect();
+                        return Err(format!(
+                            "{stage} : une seule sous-recherche est lue : « {} » suit la fin de la première et serait lu dans celle-ci ({why})",
+                            between.join(" ")
+                        ));
+                    }
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let unread: Vec<&str> = rest[..open].split_whitespace().chain(rest[close + 1..].split_whitespace()).collect();
+    refuse_unread(stage, &unread, why)
+}
+
 pub(crate) fn compile_append(stage: &str, mut sql: String, mut ocols: Vec<String>, from: i64, to: i64, depth: u32, schema: &Schema) -> Result<(String, Vec<String>), String> {
     let inner = soql_bracket(stage)?;
+    refuse_outside_brackets("append", stage.strip_prefix("append").unwrap_or(stage), "forme : `append [<sous-recherche>]`")?;
     let (sub_sql, sub_cols) = compile_depth(&inner, from, to, depth + 1, schema)?;
     let mut ucols = ocols.clone();
     for c in &sub_cols {
@@ -394,6 +510,7 @@ pub(crate) fn compile_join(stage: &str, mut sql: String, mut ocols: Vec<String>,
         return Err(format!("join : la clé « {field} » est le sac JSON ; un masque de champ est actif et le sac peut porter une valeur masquée (field-filter actif pour votre rôle : une jointure sur le sac lirait cette valeur)"));
     }
     let inner = soql_bracket(stage)?;
+    refuse_outside_brackets("join", after.strip_prefix(field).unwrap_or(after), "un seul champ de jointure est lu ; forme : `join champ [<sous-recherche>]`")?;
     let (sub_sql, sub_cols) = compile_depth(&inner, from, to, depth + 1, schema)?;
     if !ocols.iter().any(|c| c == field) || !sub_cols.iter().any(|c| c == field) {
         return Err(format!("join : le champ '{field}' doit exister des deux côtés"));
@@ -427,6 +544,7 @@ pub(crate) fn compile_mvexpand(toks: &[&str], mut sql: String, mut ocols: Vec<St
     if !soql_ident_ok(field) {
         return Err(format!("mvexpand : champ invalide : {field}"));
     }
+    refuse_unread("mvexpand", toks.get(2..).unwrap_or(&[]), "un seul champ est lu ; forme : `mvexpand champ`")?;
     let arrexpr = soql_field(field, &ocols, jf, d); // champ réel quoté OU json_extract(jf,'$.f')
     let mut sel: Vec<String> = Vec::new();
     let mut new_ocols: Vec<String> = Vec::new();
@@ -461,6 +579,12 @@ pub(crate) fn compile_lookup(toks: &[&str], mut sql: String, mut ocols: Vec<Stri
     if !soql_ident_ok(keyfield) {
         return Err(format!("lookup : champ-clé invalide : {keyfield}"));
     }
+    let output_at = toks.iter().position(|w| w.eq_ignore_ascii_case("output"));
+    refuse_unread(
+        "lookup",
+        toks.get(3..output_at.unwrap_or(toks.len())).unwrap_or(&[]),
+        "une table et un champ-clé sont lus ; forme : `lookup <table> <champ-clé> [OUTPUT col1,col2]`",
+    )?;
     // OUTPUT col1,col2 (OPTIONNEL — mais une fois TAPÉ, c'est une DEMANDE EXPLICITE). MÊME PORTE que
     // `by`/`fields`/`dedup`/`table`, et MÊME GRAMMAIRE que `table` : le BLANC y est aussi séparateur
     // (`OUTPUT a b` == `OUTPUT a,b`, mesuré) -> `commas_or_blanks`. Mesuré AVANT (identique de v0.2.0 à
@@ -468,7 +592,7 @@ pub(crate) fn compile_lookup(toks: &[&str], mut sql: String, mut ocols: Vec<Stri
     // DEMANDÉE s'évaporait sans un mot ; `OUTPUT ,a` jetait l'entrée vide en silence. La porte valide
     // aussi chaque entrée (`soql_ident_ok`), donc il n'y a plus de 2e contrôle à écrire ici.
     // `lookup` SANS `OUTPUT` reste le passe-plat documenté (expose `val` brut) : rien n'a été demandé.
-    let out_cols: Vec<String> = match toks.iter().position(|w| w.eq_ignore_ascii_case("output")) {
+    let out_cols: Vec<String> = match output_at {
         Some(oi) => FieldList::commas_or_blanks(&toks[oi + 1..].join(" "))
             .map_err(|bad| format!("lookup : colonne OUTPUT invalide : {bad}"))?
             .into_vec(),

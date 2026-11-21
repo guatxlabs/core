@@ -90,6 +90,30 @@
 
     #[test]
     #[cfg(feature = "forge")]
+    fn runs_base_refuses_unread_boolean_structure_like_search() {
+        // Toute base qui passe par `table_conds` relie ses termes par ET : la base `runs` de Forge ne
+        // lit pas plus `OR`/`AND`/`NOT` ni le groupement que `search`. Le refus nomme la base écrite.
+        for (q, want) in [
+            ("runs kind=a OR kind=b", "runs : opérateur non lu : « OR »"),
+            ("runs NOT kind=a", "runs : opérateur non lu : « NOT »"),
+            ("runs kind=a AND fired=1", "runs : opérateur non lu : « AND »"),
+            ("runs (kind=a fired=1)", "runs : parenthèse de groupement non lue : « (kind=a »"),
+            ("runs kind=(a b)", "runs : parenthèse de groupement non lue : « b) »"),
+        ] {
+            match compile(q, &forge()) {
+                Ok(c) => panic!("refus attendu pour « {q} », obtenu : {}", c.sql),
+                Err(e) => assert!(e.contains(want), "{q} -> {e}"),
+            }
+        }
+        // TÉMOINS : une paire équilibrée dans le jeton est du texte, les minuscules sont des termes.
+        for (q, like) in [("runs sleep(5)", "detail LIKE '%sleep(5)%'"), ("runs or", "detail LIKE '%or%'")] {
+            let c = compile(q, &forge()).unwrap();
+            assert!(c.sql.contains("FROM runrecord") && c.sql.contains(like), "{q} -> {}", c.sql);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "forge")]
     fn unknown_stage_rejected() {
         assert!(compile("search | nope", &forge()).is_err());
     }
@@ -1122,16 +1146,20 @@ AND lk.\"key\"=\"src_ip\"";
         assert!(!unk0.contains("json_extract(\"fields\",'$.pan')") && !unk0.contains("json_extract(fields,'$.pan')"),
             "mode 0 : identifiant inconnu émis NU (pas de json_extract) : {unk0}");
 
-        // 4) SIBLINGS déjà couverts par le choke-point `soql_field` (rename / stats-as / table) : caviardés
-        //    aussi (régression-guard -> aucun chemin d'écho de champ ne copie le sac brut).
+        // 4) SIBLINGS déjà couverts par le choke-point `soql_field` (rename / stats / table) : caviardés
+        //    aussi (régression-guard -> aucun chemin d'écho de champ ne copie le sac brut). `stats … AS
+        //    leak` n'a jamais posé d'alias : le `AS leak` était jeté (colonne `values`). Il est refusé
+        //    (« un alias n'est pas lu ») ; la forme lue est `stats values(fields)`.
         for q in [
             "search category=payment | rename fields AS leak",
-            "search category=payment | stats values(fields) AS leak",
+            "search category=payment | stats values(fields)",
             "search category=payment | table fields",
         ] {
             let s = to_sql(q, 0, 0, &sch()).unwrap();
             assert!(s.contains("json_remove") && s.contains("'$.pan'"), "sibling doit caviarder le sac : {q} -> {s}");
         }
+        let e = to_sql("search category=payment | stats values(fields) AS leak", 0, 0, &sch()).unwrap_err();
+        assert!(e.contains("un alias n'est pas lu"), "{e}");
 
         // 5) LEGIT eval INCHANGÉ : arithmétique / réf de colonne réelle non masquée -> les EXPRESSIONS eval
         //    sont émises À L'IDENTIQUE (aucun caviardage parasite sur `score`/`label`). Le seul caviardage
@@ -1999,9 +2027,14 @@ AND lk.\"key\"=\"src_ip\"";
         // refusé, mais avec le message de cette couche-là. On ne réclame donc que le refus.
         to_sql("search foo`host in (1,2)", 0, 0, &Schema::events()).expect_err("backtick refusé en amont");
         // CAS NON TRAITÉ EXPLICITEMENT, VÉRIFIÉ QUAND MÊME : sans blanc avant `in` (`host(in (1,2)`)
-        // il n'y a pas de clause du tout — la sortie est un scan plein-texte, et surtout AUCUN filtre
-        // sur `host` n'est émis. C'est l'autre face de la garde : ne pas fabriquer de filtre fantôme.
-        let s = to_sql("search host(in (1,2)", 0, 0, &Schema::events()).unwrap();
+        // il n'y a pas de clause du tout, et surtout AUCUN filtre sur `host` n'est émis. C'est l'autre
+        // face de la garde : ne pas fabriquer de filtre fantôme. Le terme libre `(1,2)` porte une
+        // parenthèse de groupement : il est refusé (il rendait `message LIKE '%(1,2)%'`) ; `host(in`
+        // seul reste un terme libre.
+        let e = to_sql("search host(in (1,2)", 0, 0, &Schema::events()).unwrap_err();
+        assert!(e.contains("parenthèse de groupement non lue : « (1,2) »"), "{e}");
+        assert!(!e.contains(" IN ("), "aucun filtre `IN` ne doit être fabriqué ici : {e}");
+        let s = to_sql("search host(in", 0, 0, &Schema::events()).unwrap();
         assert!(!s.contains(" IN ("), "aucun filtre `IN` ne doit être fabriqué ici : {s}");
         assert!(s.contains("LIKE '%host(in%'"), "{s}");
         // ATTEIGNABLE EN SOUS-RECHERCHE : la garde vaut à la profondeur maximale (3), comme au depth 0.
@@ -2014,22 +2047,32 @@ AND lk.\"key\"=\"src_ip\"";
     }
 
     #[test]
-    fn in_prepass_leading_parens_are_grouping_and_stay_legitimate() {
+    fn in_prepass_leading_parens_are_grouping_and_grouping_is_refused() {
         // CONTRE-PREUVE, ET C'EST ELLE QUI INTERDIT DE RETIRER L'EXCEPTION BÊTEMENT : une parenthèse
         // OUVRANTE DE TÊTE est du GROUPEMENT, pas une partie du nom. Elle est retirée de la tête du
         // jeton (le reste doit être un identifiant entier) puis RÉÉMISE dans le texte résiduel, où elle
-        // repart en terme libre. Goldens LITTÉRAUX relevés par sonde sur le TAG PUBLIC v0.2.0 (48035b9)
-        // ET sur 6fff644 : ces cinq formes rendent le MÊME SQL à l'octet près.
+        // repart en terme libre. Sur v0.2.0 (48035b9) jusqu'à v0.2.5 (e143c7c), ce terme libre devenait
+        // `message LIKE '%(%' AND message LIKE '%)%'` : la clause était bien lue, mais la recherche ne
+        // gardait que les événements dont le message contient des parenthèses. Le groupement n'étant
+        // pas lu par `search`, il est désormais REFUSÉ en le disant ; la clause sans groupement, elle,
+        // rend le SQL de toujours.
         let ev = Schema::events();
         let b = "SELECT ts,host,source,category,severity,src_ip,dst_ip,url,xff,message,fields FROM event";
-        for (q, want) in [
-            ("search (foo in (1,2)", format!("{b} WHERE CAST(json_extract(fields,'$.foo') AS REAL) IN (1,2) AND message LIKE '%(%'")),
-            ("search (foo in (1,2))", format!("{b} WHERE CAST(json_extract(fields,'$.foo') AS REAL) IN (1,2) AND message LIKE '%(%' AND message LIKE '%)%'")),
-            ("search ((foo in (1,2)))", format!("{b} WHERE CAST(json_extract(fields,'$.foo') AS REAL) IN (1,2) AND message LIKE '%((%' AND message LIKE '%))%'")),
-            ("search (dport in (80,443))", format!("{b} WHERE CAST(json_extract(fields,'$.dport') AS REAL) IN (80,443) AND message LIKE '%(%' AND message LIKE '%)%'")),
-            ("search a=1 (b in (1,2))", format!("{b} WHERE CAST(json_extract(fields,'$.b') AS REAL) IN (1,2) AND CAST(json_extract(fields,'$.a') AS REAL) = 1 AND message LIKE '%(%' AND message LIKE '%)%'")),
+        for q in [
+            "search (foo in (1,2)",
+            "search (foo in (1,2))",
+            "search ((foo in (1,2)))",
+            "search (dport in (80,443))",
+            "search a=1 (b in (1,2))",
         ] {
-            assert_eq!(to_sql(q, 0, 0, &ev).unwrap(), want, "groupement légitime réécrit : {q}");
+            let e = to_sql(q, 0, 0, &ev).expect_err(&format!("groupement non lu : {q}"));
+            assert!(e.contains("parenthèse de groupement non lue"), "{q} -> {e}");
+        }
+        for (q, want) in [
+            ("search foo in (1,2)", format!("{b} WHERE CAST(json_extract(fields,'$.foo') AS REAL) IN (1,2)")),
+            ("search a=1 b in (1,2)", format!("{b} WHERE CAST(json_extract(fields,'$.b') AS REAL) IN (1,2) AND CAST(json_extract(fields,'$.a') AS REAL) = 1")),
+        ] {
+            assert_eq!(to_sql(q, 0, 0, &ev).unwrap(), want, "clause sans groupement : {q}");
         }
         // Une parenthèse FERMANTE de tête, elle, n'est pas du groupement d'ouverture : le nom réclamé
         // reste `)a` et la clause est refusée. Cas jamais traité explicitement, il tombe du bon côté.
@@ -2135,9 +2178,6 @@ AND lk.\"key\"=\"src_ip\"";
             ("search foo-bar!=\"1\"", "foo-bar"),
             ("search foo-bar=~\"1\"", "foo-bar"),
             ("search foo-bar=a\"b\"", "foo-bar"),   // guillemets au MILIEU de la valeur
-            ("search foo-bar=1\"", "foo-bar"),      // guillemet ORPHELIN (jamais fermé)
-            ("search \"foo-bar=1", "foo-bar"),      // guillemet OUVRANT jamais fermé
-            ("search foo-bar\" = 1", "foo-bar"),    // le guillemet non fermé avale l'espace
             ("search foo\"-\"bar = 1", "foo-bar"),  // guillemets au MILIEU du NOM
             ("search x\"-forwarded-for\"=10.0.0.1", "x-forwarded-for"),
             ("search x-forwarded-for='10.0.0.1'", "x-forwarded-for"), // apostrophes : pas des guillemets
@@ -2152,6 +2192,22 @@ AND lk.\"key\"=\"src_ip\"";
                 Err(e) => assert!(e.contains(field), "l'erreur doit nommer le champ {field} : {e}"),
             }
         }
+        // UN GUILLEMET JAMAIS FERMÉ est refusé AVANT la garde de nom de champ, par le découpage en
+        // étapes (`soql_split_pipes_checked`) : ces trois formes étaient déjà refusées par la garde, elles
+        // le sont toujours, avec le message du guillemet.
+        for q in ["search foo-bar=1\"", "search \"foo-bar=1", "search foo-bar\" = 1"] {
+            let e = to_sql(q, 0, 0, &Schema::events()).expect_err(q);
+            assert!(e.contains("guillemet non fermé"), "{q} -> {e}");
+        }
+        // MAIS UN FILTRE D'EVENTTYPE N'EST PAS DÉCOUPÉ : `add_eventtype` ne valide rien, et
+        // `eventtype=NOM` détend le filtre stocké directement par `table_conds`. Un guillemet ouvrant
+        // jamais fermé y arrive donc encore : c'est la garde `open` de `SoqlTok::quoted_prefix` qui
+        // le refuse, sinon `foo-bar=1` passait pour une phrase guillemetée (terme libre).
+        let mut ko = KnowledgeSet::new();
+        ko.add_eventtype("ouvert", "\"foo-bar=1");
+        let e = to_sql("search eventtype=ouvert", 0, 0, &Schema::events().with_knowledge(ko))
+            .expect_err("quotation non close dans un eventtype : garde de nom de champ attendue");
+        assert!(e.contains("champ invalide dans le filtre") && e.contains("foo-bar"), "{e}");
         // ET LA MÊME CHOSE EN SOUS-RECHERCHE (depth > 0) : la revue a mesuré le contournement dans un
         // `append [...]` et un `join f [...]`.
         for q in [
@@ -2758,8 +2814,12 @@ AND lk.\"key\"=\"src_ip\"";
         // UN TEST QUI NE TROUVE AUCUNE POSITION PASSERAIT À VIDE. Le plancher est posé sur la valeur
         // MESURÉE, pas au tiers : la couverture par schéma est CONSTANTE (chaque schéma expose les
         // mêmes positions de liste), donc `positions == <par-schéma> × nb_schémas`. Réglé sur la vraie
-        // mesure : 28 positions PAR schéma, soit 84 sur les 3 schémas par défaut, 112 avec
-        // `--features forge` (4 schémas).
+        // mesure : 19 positions PAR schéma, soit 57 sur les 3 schémas par défaut, 76 avec
+        // `--features forge` (4 schémas). Il y en avait 28 tant que `stats`, `eventstats` et
+        // `timechart` jetaient un jeton d'agrégat en trop : les préfixes `count a`, `count count`,
+        // `count 1` (et `a count`, `count count`, `1 count` pour `timechart`, qui lisait le DERNIER)
+        // compilaient alors, et comptaient chacun pour une position — 3 par étape, 9 par schéma. Ils
+        // sont désormais refusés (« un seul agrégat est lu »), et ne sont plus des positions.
         //
         // Deux mutations que ce réglage attrape et que `>= 28` laissait passer :
         //  - mutS (retirer 2 des 3 schémas de la liste ci-dessus) : `schemas.len()` tombe à 1 -> échec.
@@ -2769,7 +2829,7 @@ AND lk.\"key\"=\"src_ip\"";
             "couverture de schémas réduite à {} : la dérivation doit tourner sur tous les schémas livrés",
             schemas.len()
         );
-        const PER_SCHEMA: usize = 28;
+        const PER_SCHEMA: usize = 19;
         assert_eq!(
             positions,
             PER_SCHEMA * schemas.len(),

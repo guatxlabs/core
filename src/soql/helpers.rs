@@ -800,13 +800,108 @@ pub(crate) fn soql_expr_sql(expr: &str, json_field: Option<&str>, cols: &[String
     Ok(out)
 }
 
-/// Découpe sur les pipes de PREMIER niveau (ignore les `|` dans les crochets `[ ... ]`). PUBLIC :
-/// la route-rollup de Plume (`try_rollup_route`) en dépend à la bascule.
+/// Découpe sur les pipes de PREMIER niveau : ignore les `|` dans les crochets `[ ... ]` ET dans un
+/// texte entre guillemets doubles. PUBLIC : Plume en dépend (route de rollup, imputation de source,
+/// colle GXQL, lien de recherche des alertes, planificateur froid).
+///
+/// LES GUILLEMETS. Même sémantique que `soql_tokenize_marked` : `"` bascule l'état, sans échappement.
+/// Entre guillemets, tout caractère est du TEXTE : une barre n'y coupe pas, un crochet n'y compte pas
+/// (`search url=~"a|b" | stats count` = deux étapes, `search message="a]b" | stats count` aussi). Avant,
+/// la barre d'une valeur devenait une frontière d'étape et la recherche lisait autre chose que la
+/// valeur tapée. Sur une entrée SANS guillemet, le résultat est celui de toujours, à l'octet.
+///
+/// SAUF DANS UNE ÉTAPE `rex`. `compile_rex` ne passe pas par le tokenizer : il lit le texte BRUT de son
+/// motif, une expression régulière où `\"` est un guillemet du motif (`rex message "user=\"(?<u>[^\"]+)\""`,
+/// la forme qui extrait une valeur entre guillemets). Dans cette étape — et elle seule —, entre
+/// guillemets, une barre oblique inverse échappe le caractère suivant : `\"` ne ferme pas, `\\` est
+/// une barre oblique inverse. Lu avec la bascule nue, `\"` fermait le texte, et la requête était
+/// refusée pour un guillemet non fermé qui l'était, ou coupée sur une barre du motif. HORS `rex`, rien
+/// ne change : `search message="C:\dir\"` est une valeur qui finit par une barre oblique inverse, comme
+/// le tokenizer la lit. Une étape `rex` est une étape dont le premier mot est EXACTEMENT `rex` (le mot
+/// de commande tel que `compile_depth` le reconnaît, même casse) et qui n'est pas la première étape de
+/// son niveau (la première est la base) ; à tout niveau de crochets (`append [search | rex …]` aussi).
+///
+/// UN GUILLEMET NON FERMÉ : le reste du texte appartient à l'étape où il s'ouvre (aucune étape n'est
+/// fabriquée à partir de ce qui suit). Cette fonction ne peut pas refuser sans changer de signature :
+/// le refus est porté par `soql_split_pipes_checked`, que la compilation appelle.
 pub fn soql_split_pipes(s: &str) -> Vec<String> {
+    split_pipes_scan(s).0
+}
+
+/// Découpage de la COMPILATION : celui de `soql_split_pipes`, plus le refus d'un guillemet non fermé.
+/// Un `"` ouvert jusqu'à la fin ne délimite rien : lire la requête quand même, ce serait deviner où
+/// l'utilisateur voulait le refermer.
+pub(crate) fn soql_split_pipes_checked(s: &str) -> Result<Vec<String>, String> {
+    match split_pipes_scan(s) {
+        (_, Some(pos)) => Err(format!(
+            "guillemet non fermé : le « \" » à l'octet {pos} ouvre un texte qui ne se referme pas avant la fin de la requête ; fermez-le (`champ=\"valeur\"`), ou retirez-le"
+        )),
+        (stages, None) => Ok(stages),
+    }
+}
+
+/// L'étape en cours à UN niveau de crochets (0 = la requête, 1 = une sous-recherche `[ … ]`…).
+#[derive(Clone, Copy, Default)]
+struct PipeLevel {
+    /// Une étape NON VIDE a déjà été vue à ce niveau : la suivante n'est plus la base.
+    seen: bool,
+    /// L'étape en cours porte un caractère non blanc.
+    nonblank: bool,
+    /// L'étape en cours est une étape `rex` (voir `soql_split_pipes`).
+    rex: bool,
+}
+
+/// Le premier mot de l'étape qui commence au début de `rest`, borné comme `split_whitespace` le borne
+/// dans `compile_depth` (la barre qui la termine aussi).
+fn stage_first_word(rest: &str) -> &str {
+    let rest = rest.trim_start();
+    let end = rest.find(|c: char| c.is_whitespace() || c == '|').unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Le découpage, et l'octet du guillemet resté ouvert à la fin (`None` si tous sont fermés).
+fn split_pipes_scan(s: &str) -> (Vec<String>, Option<usize>) {
     let (mut out, mut depth, mut cur) = (Vec::new(), 0i32, String::new());
-    for c in s.chars() {
+    let mut open_quote: Option<usize> = None;
+    // Entre guillemets dans une étape `rex` : le caractère précédent était une barre oblique inverse.
+    let mut escaped = false;
+    // Un niveau par profondeur de crochets POSITIVE ; un `]` orphelin (profondeur négative) ne porte
+    // aucune étape reconnue, comme à la compilation où sa barre ne coupe rien.
+    let mut levels: Vec<PipeLevel> = vec![PipeLevel::default()];
+    for (i, c) in s.char_indices() {
+        let lvl = usize::try_from(depth).ok().and_then(|d| levels.get_mut(d));
+        if open_quote.is_some() {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && lvl.is_some_and(|l| l.rex) {
+                escaped = true;
+            } else if c == '"' {
+                open_quote = None;
+            }
+            cur.push(c);
+            continue;
+        }
+        if let Some(l) = lvl {
+            if c == '|' {
+                // Frontière d'étape À CE NIVEAU (à la profondeur 0 elle coupe, plus bas elle reste dans le
+                // texte de la sous-recherche, que `compile_depth` redécoupera).
+                l.seen |= l.nonblank;
+                l.nonblank = false;
+                l.rex = l.seen && stage_first_word(&s[i + 1..]) == "rex";
+            } else if !c.is_whitespace() {
+                l.nonblank = true;
+            }
+        }
         match c {
-            '[' => { depth += 1; cur.push(c); }
+            '"' => { open_quote = Some(i); cur.push(c); }
+            '[' => {
+                depth += 1;
+                if let Ok(d) = usize::try_from(depth) {
+                    levels.resize(levels.len().max(d + 1), PipeLevel::default());
+                    levels[d] = PipeLevel::default();
+                }
+                cur.push(c);
+            }
             ']' => { depth -= 1; cur.push(c); }
             '|' if depth == 0 => { out.push(cur.trim().to_string()); cur.clear(); }
             _ => cur.push(c),
@@ -815,7 +910,7 @@ pub fn soql_split_pipes(s: &str) -> Vec<String> {
     if !cur.trim().is_empty() {
         out.push(cur.trim().to_string());
     }
-    out.into_iter().filter(|s| !s.is_empty()).collect()
+    (out.into_iter().filter(|s| !s.is_empty()).collect(), open_quote)
 }
 
 pub(crate) fn soql_bracket(stage: &str) -> Result<String, String> {

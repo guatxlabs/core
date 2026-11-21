@@ -801,8 +801,9 @@ fn soql_in_collect(first: &str, base: &BaseDef, conds: &mut Vec<String>, d: &dyn
             return c.text().to_string(); // span verbatim : pas une clause `in`
         }
         // LE GROUPEMENT N'APPARTIENT PAS À LA CLAUSE : les parenthèses ouvrantes de tête sont REMISES
-        // dans le texte résiduel, où elles repartent en terme libre exactement comme avant ce correctif
-        // (`search (foo in (1,2))` -> `… IN (1,2) AND message LIKE '%(%' AND message LIKE '%)%'`).
+        // dans le texte résiduel, où elles repartent en terme libre — et y sont REFUSÉES comme parenthèse
+        // de groupement (`unread_search_structure`). Avant ce refus, `search (foo in (1,2))` rendait
+        // `… IN (1,2) AND message LIKE '%(%' AND message LIKE '%)%'`, en silence.
         let keep = format!("{} ", c.grouping());
         // NOM DE CHAMP ENTIER, sinon REFUS : `InClause::field` rend le nom réclamé (jeton entier moins
         // le groupement de tête) ou le texte à refuser EN LE NOMMANT EN ENTIER (`cache/status`,
@@ -916,6 +917,9 @@ fn table_conds(first: &str, base: &BaseDef, d: &dyn Dialect, ko_depth: u32) -> R
             }
         }
         if !matched {
+            if let Some(msg) = unread_search_structure(&tk, first, &base.keyword) {
+                return Err(msg);
+            }
             match &base.freetext_col {
                 // FIELD FILTERS : un terme LIBRE scanne la colonne plein-texte (message) via LIKE -> si CE champ est
                 // masqué pour l'appelant, la recherche libre est un ORACLE sur sa valeur -> REJET fail-closed.
@@ -928,6 +932,75 @@ fn table_conds(first: &str, base: &BaseDef, d: &dyn Dialect, ko_depth: u32) -> R
         }
     }
     Ok(conds)
+}
+
+/// UN TERME LIBRE QUI EST EN FAIT DE LA STRUCTURE QUE LE FILTRE DE BASE NE LIT PAS.
+///
+/// Le filtre de base relie TOUS ses termes par ET et ne connaît ni opérateur booléen ni groupement.
+/// Un `OR`, un `AND`, un `NOT` nus et une parenthèse de groupement tombaient donc en terme libre
+/// (`message LIKE '%OR%'`, `message LIKE '%(host=a%'`) : la recherche rendait autre chose que ce qui
+/// était écrit — le plus souvent zéro ligne — sans rien dire. Ils sont REFUSÉS ici, en disant quoi écrire.
+///
+/// PORTÉE EXACTE (ce qui reste lu comme avant) :
+///  - seul un jeton NU — aucun guillemet dans son texte source — EXACTEMENT égal à `OR`, `AND` ou
+///    `NOT` est refusé : `"OR"` cherche le mot, et `or`/`and`/`not` en minuscules restent des termes ;
+///  - une parenthèse n'est refusée que sur un terme LIBRE (cette fonction n'est appelée que pour eux),
+///    hors guillemets, et seulement si elle GROUPE : une `(` en TÊTE du jeton (`(host=a`, `(foo)`), ou
+///    une `)` qui ne ferme aucune `(` ouverte dans le jeton (`h2)` de `host=(h1 h2)`, qui rendait
+///    `host='(h1' AND message LIKE '%h2)%'`). Une paire qui s'équilibre DANS le jeton, sans `(` de
+///    tête, est du texte et reste cherchée telle quelle (`sleep(5)`, `f()`, `foo(bar)`) ; une `(`
+///    restée ouverte hors tête aussi (`host(in`). Une valeur de champ qui porte des parenthèses
+///    (`action=~(?i)^deny$`) est un filtre et n'arrive pas ici, `"(root)"` est quoté ;
+///  - les listes `champ in (…)` / `not in (…)` sont retirées par le pré-pass avant d'arriver ici.
+fn unread_search_structure(tk: &SoqlTok, src: &str, keyword: &str) -> Option<String> {
+    let raw = &src[tk.beg..tk.end];
+    if !raw.contains('"') {
+        let hint = match tk.text.as_str() {
+            "OR" => Some("pour une alternative : `champ in (a, b)` ou `champ=~\"a|b\"`"),
+            "AND" => Some("la conjonction est implicite (`a b` = a ET b) : retirez `AND`"),
+            "NOT" => Some("pour une négation : `champ!=valeur` ou `champ not in (a, b)`"),
+            _ => None,
+        };
+        if let Some(hint) = hint {
+            return Some(format!(
+                "{keyword} : opérateur non lu : « {op} » (les termes de `{keyword}` sont toujours reliés par ET ; {hint} ; pour chercher le mot lui-même, mettez-le entre guillemets : \"{op}\")",
+                op = tk.text
+            ));
+        }
+    }
+    // Chaque caractère du texte source, avec son état de quotation (même bascule que le tokenizer ; un
+    // jeton commence toujours hors guillemets).
+    let mut inq = false;
+    let mut chars: Vec<(char, bool)> = Vec::new();
+    for c in raw.chars() {
+        if c == '"' {
+            inq = !inq;
+        } else {
+            chars.push((c, inq));
+        }
+    }
+    let leading = matches!(chars.first(), Some(('(', false)));
+    let mut depth = 0usize;
+    let mut stray_close = false;
+    for &(c, quoted) in &chars {
+        match c {
+            _ if quoted => {}
+            '(' => depth += 1,
+            ')' if depth == 0 => {
+                stray_close = true;
+                break;
+            }
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    if leading || stray_close {
+        return Some(format!(
+            "{keyword} : parenthèse de groupement non lue : « {raw} » (les termes de `{keyword}` sont toujours reliés par ET, sans groupement : retirez les parenthèses ; pour une alternative : `champ in (a, b)` ou `champ=~\"a|b\"` ; pour chercher ce texte tel quel, mettez-le entre guillemets : \"{}\")",
+            tk.source_unquoted(src)
+        ));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1247,7 +1320,7 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
     if expanded.len() as i64 > max_text {
         return Err(format!("requête trop longue après détente des macros : {} octets de texte (maximum {max_text})", expanded.len()));
     }
-    let stages = soql_split_pipes(&expanded);
+    let stages = soql_split_pipes_checked(&expanded)?;
     if stages.is_empty() {
         return Err("GXQL vide".into());
     }
@@ -1373,7 +1446,7 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
             "dedup" => compile_dedup(&toks, sql, ocols, jf, d)?,
             "top" | "rare" => compile_top(&toks, sql, ocols, jf, d)?,
             "eventstats" => compile_eventstats(&toks, sql, ocols, jf, d)?,
-            "rate" => compile_rate(sql, ocols, jf)?,
+            "rate" => compile_rate(&toks, sql, ocols, jf)?,
             "eval" => compile_eval(stage, sql, ocols, jf, d)?,
             "append" => compile_append(stage, sql, ocols, from, to, depth, schema)?,
             "join" => compile_join(stage, sql, ocols, jf, from, to, depth, schema)?,
