@@ -9,7 +9,7 @@ license = "LGPL-3.0-or-later"   # SPDX. `-or-later` = lecture conventionnelle «
                                 # `LGPL-3.0-only` si l'on veut figer la version (changement d'une ligne).
 repository = "https://github.com/guatxlabs/core"
 readme = "README.md"
-description = "GuatX shared core (Plume ↔ Forge) — the ~70 % common part extracted from Plume. v0: soql engine + store/secret SPI, minimal dependencies (regex, serde_json, secrecy, zeroize). To be extended (auth/host-guard, read-only execution) as it stabilises."
+description = "Shared core of Plume and Forge: the GXQL query compiler, MITRE ATT&CK tactic mapping, CIM contract, STIX threat-intelligence translation, store data types and a secret-provider SPI, with minimal dependencies."
 
 [lib]
 name = "guatx_core"
