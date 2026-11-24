@@ -55,9 +55,9 @@ let c = compile("search severity=HIGH | stats count by mitre | sort -count", &Sc
 // delegated to the target's `Dialect` (SQLite/DuckDB/ClickHouse), it is the single choke point.
 ```
 ```sh
-cargo test                   # 161 tests (155 unit + 5 differential parity + 1 doctest)
-cargo test --features forge  # 181 tests (Forge schema + tests enabled)
-cargo test --all-features    # 190 tests (+ `ai` and `cold_tier` modules)
+cargo test                   # 194 tests (166 unit + 22 integration + 5 differential parity + 1 doctest), 2 ignored
+cargo test --features forge  # 216 tests (Forge schema + tests enabled)
+cargo test --all-features    # 225 tests (+ `ai` and `cold_tier` modules)
 ```
 
 ### Field name and full-text search
@@ -239,7 +239,7 @@ require restarting the service; on the other hand a valid value already read sta
 restart.
 
 ## Status
-- ✅ Plume's compiler **promoted + generalised** here (18 pipeline stages, schema-generic). Full suite: 161 tests (181 with `--features forge`).
+- ✅ Plume's compiler **promoted + generalised** here (18 pipeline stages, schema-generic). Full suite: 194 tests (216 with `--features forge`, 225 with `--all-features`), measured on 2026-11-24 on version 0.2.6.
 - ✅ Consumed by the Forge console and by Plume via a **git-dep pinned by tag**:
   `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.2" }` — a standalone clone of
   either product compiles without having this repository next to it. **Pin `v0.2.2` or later.**

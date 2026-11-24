@@ -54,9 +54,9 @@ let c = compile("search severity=HIGH | stats count by mitre | sort -count", &Sc
 // délégué au `Dialect` de la cible (SQLite/DuckDB/ClickHouse), c'est le point d'étranglement unique.
 ```
 ```sh
-cargo test                   # 161 tests (155 unitaires + 5 parité différentielle + 1 doctest)
-cargo test --features forge  # 181 tests (schéma + tests Forge activés)
-cargo test --all-features    # 190 tests (+ modules `ai` et `cold_tier`)
+cargo test                   # 194 tests (166 unitaires + 22 d'intégration + 5 parité différentielle + 1 doctest), 2 ignorés
+cargo test --features forge  # 216 tests (schéma + tests Forge activés)
+cargo test --all-features    # 225 tests (+ modules `ai` et `cold_tier`)
 ```
 
 ### Nom de champ et recherche plein-texte
@@ -239,7 +239,7 @@ demande **pas** de redémarrer le service ; en revanche une valeur valide déjà
 redémarrage.
 
 ## Statut
-- ✅ Compilateur de Plume **promu + généralisé** ici (18 étapes de pipeline, schéma-générique). Suite complète : 161 tests (181 avec `--features forge`).
+- ✅ Compilateur de Plume **promu + généralisé** ici (18 étapes de pipeline, schéma-générique). Suite complète : 194 tests (216 avec `--features forge`, 225 avec `--all-features`), mesurés le 2026-11-24 sur la version 0.2.6.
 - ✅ Consommé par la console Forge et par Plume via une **git-dep épinglée par tag** :
   `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.2" }` — un clone autonome de
   l'un ou l'autre produit compile sans avoir ce dépôt en voisin. **Épinglez `v0.2.2` ou plus récent.**
