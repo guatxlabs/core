@@ -411,7 +411,7 @@ impl Schema {
             field_masks: FieldMaskSet::new(), // FIELD FILTERS : Forge n'injecte jamais de masque (émission legacy)
             field_knowledge: KnowledgeSet::new(), // KNOWLEDGE OBJECTS : Forge n'utilise pas les KO (émission legacy)
             prune_message_projection: false, // Phase B : OFF (Forge finding/runrecord n'ont pas de colonne `message`)
-            row_filter: None, // H1 : DÉFAUT community = pas de filtre (byte-identique) ; la console pose `with_row_filter` en enterprise
+            row_filter: None, // H1 : par défaut, aucun filtre de lignes (SQL byte-identique) ; un consommateur en pose un par `with_row_filter`
             cursor_id: false, // Keyset : OFF ; finding/runrecord n'ont pas de colonne `id` réelle -> no-op de toute façon
         }
     }
