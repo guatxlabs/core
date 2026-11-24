@@ -1,5 +1,7 @@
 # Security Policy
 
+[English](SECURITY.md) | [Français](SECURITY.fr.md)
+
 guatx-core is the **shared, security-critical core** of GuatX: a single audited implementation of
 the GXQL query compiler and the field-masking / row-scoping layer that both Plume (blue SOC) and the
 Forge console (red) depend on. A flaw here defeats a control in *both* products at once, so we want

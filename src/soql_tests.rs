@@ -2995,22 +2995,34 @@ AND lk.\"key\"=\"src_ip\"";
             .lines()
             .filter(|l| l.trim_start().starts_with('"') && l.contains("=> compile_"))
             .count();
-        let readme = include_str!("../README.md");
         assert_eq!(arms, 18, "bras du dispatcheur");
         assert_eq!(steps.len(), 20, "noms d'étape acceptés");
-        for claim in [
-            format!("{arms} étapes de pipeline"),
-            format!("{} noms", steps.len()),
-        ] {
-            assert!(readme.contains(&claim), "le README ne porte pas « {claim} »");
+        // Le README existe en DEUX langues (README.md en anglais, README.fr.md en français) : chacune
+        // porte les deux chiffres dans sa langue, et chacune est jugée, pour qu'aucune ne dérive seule.
+        let readmes = [
+            (
+                "README.md",
+                include_str!("../README.md"),
+                [format!("{arms} pipeline stages"), format!("{} names", steps.len())],
+            ),
+            (
+                "README.fr.md",
+                include_str!("../README.fr.md"),
+                [format!("{arms} étapes de pipeline"), format!("{} noms", steps.len())],
+            ),
+        ];
+        for (file, readme, claims) in &readmes {
+            for claim in claims {
+                assert!(readme.contains(claim.as_str()), "{file} ne porte pas « {claim} »");
+            }
+            // Et chaque nom accepté est CITÉ dans le README : la liste ne peut plus être incomplète.
+            let missing: Vec<&str> = steps
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .filter(|n| !readme.contains(&format!("`{n}`")))
+                .collect();
+            assert!(missing.is_empty(), "étapes acceptées mais absentes de {file} : {missing:?}");
         }
-        // Et chaque nom accepté est CITÉ dans le README : la liste ne peut plus être incomplète.
-        let missing: Vec<&str> = steps
-            .iter()
-            .map(|(n, _)| n.as_str())
-            .filter(|n| !readme.contains(&format!("`{n}`")))
-            .collect();
-        assert!(missing.is_empty(), "étapes acceptées mais absentes du README : {missing:?}");
     }
 
     #[test]

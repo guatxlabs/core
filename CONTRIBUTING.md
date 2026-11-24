@@ -1,5 +1,7 @@
 # Contributing to guatx-core
 
+[English](CONTRIBUTING.md) | [Français](CONTRIBUTING.fr.md)
+
 Thanks for your interest in guatx-core — the shared, security-critical core of GuatX (the GXQL
 compiler + masking/scoping layer that both Plume and the Forge console depend on). Contributions are
 welcome, under a few rules that exist because this crate is **safety-critical**: a bug here breaks a
@@ -43,14 +45,14 @@ guatx-core is a **standalone Rust library** (`Cargo.toml` at the repo root, mini
 No Python, no database, no sibling checkout — a plain clone builds and tests.
 
 ```sh
-cargo test                        # default build: feature OFF (~70% shared, the community build)
+cargo test                        # default build: feature OFF (~70% shared, no product feature)
 cargo test --features forge       # + the Forge schema (Schema::forge()) and its tests
 cargo test --all-features         # + the `ai` and `cold_tier` modules (CI gates this pass too)
 cargo clippy --all-targets --all-features   # advisory lint — do not INCREASE the warning count
 ```
 
 Everything must be **green** and **offline** — tests must not touch the network. The default
-(feature-OFF) build is the community build and must stay byte-compatible: `--features forge` only
+(feature-OFF) build is the shared build and must stay byte-compatible: `--features forge` only
 *adds* the red schema and its tests, it never changes the shared compiler.
 
 ## Code style
@@ -81,35 +83,35 @@ guatx-core exists so the critical primitives — read-only compilation, masking,
 around those controls, or that split them into a second divergent path, are out of scope for this
 project.
 
-## Écrire pour le public
+## Writing for the public
 
-Ce dépôt est public. Tout ce qui y est écrit — messages de commit, documentation,
-commentaires de code — s'adresse au **lecteur futur du code**, pas à une personne ni à une
+This repository is public. Everything written in it — commit messages, documentation,
+code comments — is addressed to the **future reader of the code**, not to a person or to a
 conversation.
 
-**Un message de commit dit CE QUI CHANGE et POURQUOI.** Il n'a pas à raconter le
-déroulement du travail. À proscrire :
+**A commit message says WHAT CHANGES and WHY.** It does not have to tell the story of how
+the work went. To be avoided:
 
-- nommer une personne, ou citer un échange privé ;
-- le récit à la première personne (« j'ai essayé », « ma première version ») ;
-- les repères de session (« hier », « ce matin », « la quatrième fois aujourd'hui ») ;
-- un chemin machine (`/home/<compte>`), un pseudo personnel, une adresse tierce.
+- naming a person, or quoting a private exchange;
+- first-person narrative ("I tried", "my first version");
+- session markers ("yesterday", "this morning", "the fourth time today");
+- a machine path (`/home/<compte>`), a personal handle, a third-party address.
 
-Ce qui a de la valeur et doit rester : la **mesure** (chiffres et date), ce qui a été
-**réfuté**, et la **raison** d'un choix de conception. Le journal de travail, lui, a sa
-place dans un dépôt interne — pas dans l'historique public.
+What has value and must stay: the **measurement** (figures and date), what was
+**refuted**, and the **reason** for a design choice. The work log belongs in an internal
+repository — not in the public history.
 
-**Identité.** Tous les commits sont signés `guatxlabs <noreply@guatx.com>`. À poser dans
-chaque clone, car un clone frais hérite de la configuration globale de la machine :
+**Identity.** All commits are signed `guatxlabs <noreply@guatx.com>`. Set it in
+each clone, because a fresh clone inherits the machine's global configuration:
 
 ```sh
 git config user.name  "guatxlabs"
 git config user.email "noreply@guatx.com"
-git config core.hooksPath .githooks   # arme les gardes ci-dessous
+git config core.hooksPath .githooks   # arms the guards below
 ```
 
-**Deux gardes versionnées** appliquent le mécanisable : `pre-commit` refuse un commit dont
-l'auteur n'est pas le canonique ; `commit-msg` refuse un message portant un chemin machine,
-un pseudo personnel ou une adresse tierce. Le STYLE, lui, n'est pas mécanisé : une garde
-qui prétendrait en juger produirait du bruit et finirait désarmée. Il se tient à la
-relecture.
+**Two versioned guards** enforce what can be mechanised: `pre-commit` refuses a commit whose
+author is not the canonical one; `commit-msg` refuses a message carrying a machine path,
+a personal handle or a third-party address. STYLE, on the other hand, is not mechanised: a guard
+that claimed to judge it would produce noise and would end up disarmed. It is upheld at
+review.

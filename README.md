@@ -1,253 +1,256 @@
 # guatx-core
 
-**Cœur partagé GuatX — neutre, public.** Le ~70 % commun à Plume (SOC bleu, publication à venir) et à la console
-Forge (rouge), extrait pour n'avoir **qu'une seule implémentation** des primitives critiques.
+[English](README.md) | [Français](README.fr.md)
 
-*Rust · lib · dépendances minimales : `regex`, `serde_json`, `secrecy`, `zeroize` (4 crates, toutes déjà
-présentes dans l'arbre des consommateurs — aucune crate native/compilée nouvelle).*
+**GuatX shared core — neutral, public.** The ~70 % common to Plume (blue SOC, published under AGPL-3.0:
+[guatxlabs/plume](https://github.com/guatxlabs/plume)) and to the Forge console (red),
+extracted so that the critical primitives have **a single implementation**.
+
+*Rust · lib · minimal dependencies: `regex`, `serde_json`, `secrecy`, `zeroize` (4 crates, all already
+present in the consumers' dependency tree — no new native/compiled crate).*
 
 Licensed under LGPL-3.0-or-later, see [COPYING.LESSER](COPYING.LESSER).
 
-## Pourquoi
-- **Source unique de vérité** : un bug corrigé / une feature ajoutée une fois profite aux deux produits.
-- **Cohérence sécurité** : les garde-fous (compilation read-only, allowlist anti-injection, auth) sont
-  **critiques** → une seule implémentation auditée vaut mieux que deux qui divergent.
+## Why
+- **Single source of truth**: a bug fixed / a feature added once benefits both products.
+- **Security consistency**: the guards (read-only compilation, anti-injection allowlist, auth) are
+  **critical** → one audited implementation is better than two that diverge.
 
-## Contenu
-- `soql` — le compilateur **GXQL** (*GuatX Query Language* ; **anciennement appelé « SOQL »** — même
-  langage, même syntaxe, seul le nom change : `SOQL` était le nom du langage de requête de Salesforce).
-  Le **module Rust reste `soql`** : le renommage porte sur le **nom du langage**, pas sur l'API — les
-  identifiants publics (`guatx_core::soql::*`, `soql_esc`, `GUATX_SOQL_MAX_*`) sont **inchangés**, la
-  lib est taguée v0.2.2 et consommée telle quelle par Plume et Forge.
-  **La frontière du renommage, pour qu'elle ne soit pas prise pour un oubli :** ce qu'un UTILISATEUR
-  lit dit `GXQL` (interfaces, documentation, messages d'erreur rendus) ; ce qu'un CONTRIBUTEUR lit
-  garde `soql` (nom de module, identifiants, et les commentaires de `src/soql/` qui les décrivent).
-  Renommer la prose d'un module qui s'appelle `soql`, à côté de fonctions `soql_*`, aurait rendu le
-  code MOINS lisible, pas plus. Le critère est donc l'API, pas le fichier.
-  Le compilateur **type-SPL complet de Plume**, promu ici et rendu **schéma-générique**
-  (`Schema::events()` pour Plume · `Schema::forge()` pour Forge). Une base (`search` / `metric` /
-  `<alt>`) puis **18 étapes de pipeline**, sous **20 noms** (`head`/`limit` et `top`/`rare` sont deux
-  paires d'alias) : `stats` · `timechart` · `where` · `sort` · `head`/`limit` · `rex` · `fields` ·
+## Contents
+- `soql` — the **GXQL** compiler (*GuatX Query Language*; **formerly called "SOQL"** — same
+  language, same syntax, only the name changes: `SOQL` was the name of Salesforce's query language).
+  The **Rust module stays `soql`**: the rename applies to the **language name**, not to the API — the
+  public identifiers (`guatx_core::soql::*`, `soql_esc`, `GUATX_SOQL_MAX_*`) are **unchanged**, the
+  lib is tagged v0.2.2 and consumed as is by Plume and Forge.
+  **Where the rename stops, so that it is not taken for an oversight:** what a USER reads says
+  `GXQL` (interfaces, documentation, rendered error messages); what a CONTRIBUTOR reads keeps `soql`
+  (module name, identifiers, and the comments of `src/soql/` that describe them).
+  Renaming the prose of a module called `soql`, next to `soql_*` functions, would have made the
+  code LESS readable, not more. The criterion is therefore the API, not the file.
+  Plume's **complete SPL-like compiler**, promoted here and made **schema-generic**
+  (`Schema::events()` for Plume · `Schema::forge()` for Forge). A base (`search` / `metric` /
+  `<alt>`) then **18 pipeline stages**, under **20 names** (`head`/`limit` and `top`/`rare` are two
+  alias pairs): `stats` · `timechart` · `where` · `sort` · `head`/`limit` · `rex` · `fields` ·
   `table` · `rename` · `dedup` · `top`/`rare` · `eventstats` · `rate` · `eval` · `mvexpand` ·
-  `lookup` · `append`[..] · `join` f[..]. Ces deux chiffres sont ceux du **dispatcheur**, et un test
-  les y compare (`the_readme_step_count_is_the_one_the_dispatcher_gives`) — la liste ci-dessus ne
-  peut donc plus cesser de suivre le code, ce qui est exactement ce qui était arrivé au « 16 » qu'elle
-  annonçait. SQL **read-only**, valeurs **échappées+inlinées**
-  (`soql_esc`, quotes doublées), idents validés, mots-clés SQL interdits dans `eval`, récursion ≤3.
-  Les UDF `regexp`/`re_cap` (pour `=~`/`rex`) sont enregistrées par le consommateur sur sa connexion.
+  `lookup` · `append`[..] · `join` f[..]. These two figures are the **dispatcher's**, and a test
+  compares them to it (`the_readme_step_count_is_the_one_the_dispatcher_gives`) — the list above
+  can therefore no longer stop following the code, which is exactly what had happened to the "16" it
+  used to announce. **Read-only** SQL, values **escaped+inlined**
+  (`soql_esc`, doubled quotes), idents validated, SQL keywords forbidden in `eval`, recursion ≤3.
+  The `regexp`/`re_cap` UDFs (for `=~`/`rex`) are registered by the consumer on its connection.
 
-À venir : auth (argon2 + host-guard anti-rebinding), exécution read-only, helpers de packaging.
+Coming next: auth (argon2 + anti-rebinding host-guard), read-only execution, packaging helpers.
 
-## Règle d'or
-**Rien d'offensif ici.** Modules d'attaque, évasion WAF/CF, logique ROE → restent dans **Forge**, dépôt
-séparé qui dépend de ce cœur. `guatx-core` ne contient que de l'infra générique (requête, auth, stockage).
+## Golden rule
+**Nothing offensive here.** Attack modules, WAF/CF evasion, ROE logic → stay in **Forge**, a separate
+repository that depends on this core. `guatx-core` contains only generic infrastructure (query, auth,
+storage).
 
 ## Usage
 ```rust
 use guatx_core::soql::{compile, Schema};
 let c = compile("search severity=HIGH | stats count by mitre | sort -count", &Schema::events())?;
-// c.sql = SQL read-only prêt à exécuter ; c.columns = colonnes de sortie.
-// NB : le compilateur ÉCHAPPE et INLINE les valeurs (pas de paramètres liés) — l'échappement est
-// délégué au `Dialect` de la cible (SQLite/DuckDB/ClickHouse), c'est le point d'étranglement unique.
+// c.sql = read-only SQL ready to execute; c.columns = output columns.
+// NB: the compiler ESCAPES and INLINES the values (no bound parameters) — escaping is
+// delegated to the target's `Dialect` (SQLite/DuckDB/ClickHouse), it is the single choke point.
 ```
 ```sh
-cargo test                   # 161 tests (155 unitaires + 5 parité différentielle + 1 doctest)
-cargo test --features forge  # 181 tests (schéma + tests Forge activés)
-cargo test --all-features    # 190 tests (+ modules `ai` et `cold_tier`)
+cargo test                   # 161 tests (155 unit + 5 differential parity + 1 doctest)
+cargo test --features forge  # 181 tests (Forge schema + tests enabled)
+cargo test --all-features    # 190 tests (+ `ai` and `cold_tier` modules)
 ```
 
-### Nom de champ et recherche plein-texte
-Un nom de champ n'accepte que **lettres, chiffres et `_`**.
+### Field name and full-text search
+A field name accepts only **letters, digits and `_`**.
 
-**Ce qui est refusé.** Dans un filtre de base (`search …`) ou un `where`, un terme dont la **partie
-gauche** a la *forme* d'un nom de champ sans en être un valide est **refusé**, avec un message qui
-nomme cette partie gauche. Sont concernées les deux syntaxes de filtre :
+**What is refused.** In a base filter (`search …`) or a `where`, a term whose **left-hand side** has
+the *shape* of a field name without being a valid one is **refused**, with a message that names that
+left-hand side. Both filter syntaxes are concerned:
 
-| Syntaxe | Ce qui décide du nom | Refusé |
+| Syntax | What decides the name | Refused |
 |---|---|---|
-| jeton `nom<op>valeur` (`=` `:` `!=` `>=` `<=` `>` `<` `=~`), collé ou espacé | la partie gauche de l'opérateur, blancs délimiteurs retirés | `x-forwarded-for=1.2.3.4` · `http.status>=500` · `foo-bar = 1` · `x-forwarded-for="10.0.0.1"` (guillemeter la *valeur* n'exempte pas) |
-| clause `nom [not] in (…)` | tout ce qui précède `in` jusqu'à la frontière du jeton (le **blanc**, la seule de ce langage), **moins** les parenthèses ouvrantes de tête, qui sont du groupement — **pas** une classe de caractères | `src-ip in (10,11)` · `cache/status in (200,302)` · `user@host in (1,2)` · `-foo in (1,2)` · `foo(host in (1,2)` · `count(src_ip in (10,11))` |
+| token `nom<op>valeur` (`=` `:` `!=` `>=` `<=` `>` `<` `=~`), attached or spaced | the left-hand side of the operator, delimiting blanks removed | `x-forwarded-for=1.2.3.4` · `http.status>=500` · `foo-bar = 1` · `x-forwarded-for="10.0.0.1"` (quoting the *value* does not exempt) |
+| clause `nom [not] in (…)` | everything before `in` up to the token boundary (the **blank**, the only one in this language), **minus** the leading opening parentheses, which are grouping — **not** a character class | `src-ip in (10,11)` · `cache/status in (200,302)` · `user@host in (1,2)` · `-foo in (1,2)` · `foo(host in (1,2)` · `count(src_ip in (10,11))` |
 
-Le laisser filer donnerait un scan plein-texte non borné — ou, pour `in (…)`, un filtre sur un *autre*
-champ que celui écrit (le suffixe après le séparateur) : dans les deux cas un jeu de lignes différent
-de celui demandé, sans un mot. La garde vaut aux mêmes conditions dans une sous-recherche
-(`append […]`, `join f […]`), à toute profondeur.
+Letting it through would give an unbounded full-text scan — or, for `in (…)`, a filter on a *different*
+field than the one written (the suffix after the separator): in both cases a set of rows different
+from the one requested, without a word. The guard applies under the same conditions in a sub-search
+(`append […]`, `join f […]`), at any depth.
 
-**Ce qui n'est PAS refusé.** Une parenthèse ouvrante **de tête** est du **groupement**, pas une partie
-du nom : elle est retirée de la tête du jeton, remise dans le texte du filtre, et le reste doit être un
-identifiant entier. Mesuré : `search (dport in (80,443))` et `search ((foo in (1,2)))` rendent le SQL
-de v0.2.0 à l'octet près, tandis que `search foo(host in (1,2)` est refusé. Le peeling n'a lieu qu'**en
-tête** : `search (a) in (1,2)` réclame `a)` et est refusé.
+**What is NOT refused.** A **leading** opening parenthesis is **grouping**, not part of the name: it
+is removed from the head of the token, put back into the filter text, and the rest must be a whole
+identifier. Measured: `search (dport in (80,443))` and `search ((foo in (1,2)))` give the SQL of
+v0.2.0 byte for byte, while `search foo(host in (1,2)` is refused. The peeling only happens **at the
+head**: `search (a) in (1,2)` claims `a)` and is refused.
 
-Une **phrase quotée** reste une recherche plein-texte, inchangée :
-`search "user-agent=curl/7.68"`, `search "x-forwarded-for in (1,2)"`, `search "foo-bar"=1`. La
-quotation compte pour ce qu'elle couvre à **gauche de l'opérateur**, pas pour le fait qu'il y ait un
-guillemet quelque part : `search source="web"` reste le filtre indexé `"source" = 'web'`, et
-`search x-forwarded-for="10.0.0.1"` est refusé. Une quotation **non close** n'exempte rien.
+A **quoted phrase** remains a full-text search, unchanged:
+`search "user-agent=curl/7.68"`, `search "x-forwarded-for in (1,2)"`, `search "foo-bar"=1`. Quoting
+counts for what it covers **to the left of the operator**, not for there being a quote somewhere:
+`search source="web"` remains the indexed filter `"source" = 'web'`, and
+`search x-forwarded-for="10.0.0.1"` is refused. An **unclosed** quote exempts nothing.
 
-**L'échappatoire.** Dans un **filtre de base**, le message d'erreur suggère votre propre texte entre
-guillemets — c'est une tranche du texte que vous avez tapé, espaces et ponctuation compris. Mesuré :
-`search foo-bar = 1` suggère `"foo-bar = 1"`, et `search "foo-bar = 1"` compile en
-`message LIKE '%foo-bar = 1%'`. Les guillemets étant des **délimiteurs** (le tokenizer ne les conserve
-jamais), le texte suggéré est le vôtre *sans ses guillemets internes* : `search foo-bar=a"b"` suggère
-`"foo-bar=ab"`. L'étape `where` refuse elle aussi un nom invalide, mais avec son libellé propre et
-**sans** suggestion (`where : champ invalide : foo-bar` — mesuré) : `where` n'a pas de recherche
-plein-texte vers laquelle se rabattre.
+**The escape hatch.** In a **base filter**, the error message suggests your own text in quotes — it
+is a slice of the text you typed, spaces and punctuation included. Measured: `search foo-bar = 1`
+suggests `"foo-bar = 1"`, and `search "foo-bar = 1"` compiles to `message LIKE '%foo-bar = 1%'`.
+Quotes being **delimiters** (the tokenizer never keeps them), the suggested text is yours *without
+its inner quotes*: `search foo-bar=a"b"` suggests `"foo-bar=ab"`. The `where` stage also refuses an
+invalid name, but with its own wording and **without** a suggestion (`where : champ invalide : foo-bar`
+— measured): `where` has no full-text search to fall back on.
 
-**Limite mesurée, non fermée :** cette garde n'existe pas dans `eval`, et ne peut pas y exister — dans
-une expression, `-` est l'opérateur de soustraction. `search | eval x = foo-bar` émet `(foo-bar)` et
-`eval x = foo - bar` émet `(foo - bar)` : **ces deux SQL ne sont pas identiques à l'octet** — ils ne
-diffèrent que par des blancs (mesuré par le test ci-dessous), et SQLite les compile en le **même
-programme** (mesuré : `EXPLAIN SELECT (foo-bar) FROM t` et `EXPLAIN SELECT (foo - bar) FROM t` rendent
-un bytecode identique, sqlite 3.53.3). Rien dans l'entrée ne sépare donc les deux lectures ; un nom mal
-écrit y échoue à l'**exécution** (colonne inexistante) et non à la compilation ; même là, un `'` isolé
-est rejeté (`eval : chaîne non terminée`), pas inliné brut.
+**Measured limit, not closed:** this guard does not exist in `eval`, and cannot exist there — in an
+expression, `-` is the subtraction operator. `search | eval x = foo-bar` emits `(foo-bar)` and
+`eval x = foo - bar` emits `(foo - bar)`: **these two SQL strings are not byte-identical** — they only
+differ by blanks (measured by the test below), and SQLite compiles them into the **same program**
+(measured: `EXPLAIN SELECT (foo-bar) FROM t` and `EXPLAIN SELECT (foo - bar) FROM t` give identical
+bytecode, sqlite 3.53.3). Nothing in the input therefore separates the two readings; a misspelt name
+fails there at **execution** (nonexistent column) and not at compilation; even there, an isolated `'`
+is rejected (`eval : chaîne non terminée`), not inlined raw.
 
-**Aucun nom écrit ne ressort brut dans le SQL — propriété dérivée, non énumérée.** Un nom de champ qui
-atteint le SQL doit être soit **refusé** (un identifiant valide ne contient pas de guillemet simple),
-soit ressortir **échappé** (une valeur légitime a son `'` doublé). Le test
-`no_user_written_name_reaches_the_sql_raw_whatever_the_step` engendre depuis le dispatcheur — sans
-nommer d'étape — un jeton portant un `'` dans chaque position d'argument de chaque étape, sur les 4
-schémas, et vérifie que sa **forme brute** n'apparaît jamais dans le SQL émis : sinon un nom aurait fui
-sans validation (`json_extract(fields,'$.a'b')`, littéral cassé) ou une valeur serait sortie non
-échappée. C'est ce qui remplace l'ancienne énumération à la main (qui prétendait lister « les autres
-étapes » et oubliait `rex` et `join`, tous deux mesurés comme validant) — `eval` reste la seule
-exception documentée ci-dessus, et elle refuse quand même le `'` non terminé.
+**No written name comes out raw in the SQL — a derived property, not an enumerated one.** A field
+name that reaches the SQL must either be **refused** (a valid identifier contains no single quote),
+or come out **escaped** (a legitimate value has its `'` doubled). The test
+`no_user_written_name_reaches_the_sql_raw_whatever_the_step` generates from the dispatcher — without
+naming any stage — a token carrying a `'` in every argument position of every stage, on the 4
+schemas, and checks that its **raw form** never appears in the emitted SQL: otherwise a name would
+have leaked without validation (`json_extract(fields,'$.a'b')`, broken literal) or a value would
+have come out unescaped. This is what replaces the former hand-written enumeration (which claimed to
+list "the other stages" and forgot `rex` and `join`, both measured as validating) — `eval` remains
+the only exception documented above, and it still refuses the unterminated `'`.
 
-**Une liste de champs séparée par des virgules est décidée à un seul endroit** (`FieldList`) : `stats
-by`, `timechart by`, `eventstats by`, `metric by`, `fields`, `dedup`, `table` et `lookup … OUTPUT`.
-Aucune entrée n'y est jetée, donc une liste demandée ne peut pas s'évaporer en silence ni émettre du
-SQL invalide. Mesuré, refusé partout où le séparateur est la **virgule seule** : `by`, `by ,`,
+**A comma-separated field list is decided in a single place** (`FieldList`): `stats
+by`, `timechart by`, `eventstats by`, `metric by`, `fields`, `dedup`, `table` and `lookup … OUTPUT`.
+No entry is dropped there, so a requested list cannot evaporate silently nor emit invalid SQL.
+Measured, refused everywhere the separator is the **comma alone**: `by`, `by ,`,
 `by ,src_ip`, `by src_ip,`, `by src_ip,,host`, `fields`, `fields ,`, `fields ,src_ip`, `dedup ,src_ip`.
 
-**Un nom dans `by` doit être en portée** (`field_in_scope`, même porte pour `stats by`, `timechart by`,
-`eventstats by`). Le critère est dérivé de la résolution de champ : une colonne vivante (colonne réelle
-de la base, label déclaré par `metric … by <label>`, alias produit par une étape amont), un alias de
-knowledge object dont la source est vivante, ou une clé du sac JSON tant que le sac (`fields`) est encore
-en portée — les clés sont dynamiques, une clé absente groupe sous NULL. Tout autre nom est refusé en le
-nommant et en listant la portée. Ce que ce refus ferme, mesuré : `metric x | stats max(value) by date`
-compilait en `GROUP BY "date"` ; faute de colonne, SQLite lit `"date"` comme la chaîne littérale, toutes
-les lignes tombent sous un seul libellé et la requête rend UNE ligne dont la première colonne vaut
-« date » — un total déguisé en groupe. Même mécanique après un repli du sac : `… | stats count by src_ip
-| stats sum(count) by dport`. Le message oriente vers `timechart span=<durée>` quand le nom est un mot de
-calendrier (`date`, `hour`, …) : la tranche de temps existe dans le langage, c'est `timechart span=`,
-pas `by hour`. Limite connue : sur une base à sac JSON, `by date` reste une clé JSON plausible
-(`fields.date`) — indécidable à la compilation, la sortie montre alors une clé NULL, jamais le libellé.
+**A name in `by` must be in scope** (`field_in_scope`, the same door for `stats by`, `timechart by`,
+`eventstats by`). The criterion is derived from field resolution: a live column (a real column of
+the base, a label declared by `metric … by <label>`, an alias produced by an upstream stage), a
+knowledge object alias whose source is live, or a key of the JSON bag as long as the bag (`fields`)
+is still in scope — keys are dynamic, an absent key groups under NULL. Any other name is refused,
+naming it and listing the scope. What this refusal closes, measured: `metric x | stats max(value) by date`
+compiled to `GROUP BY "date"`; for lack of a column, SQLite reads `"date"` as the literal string, all
+rows fall under a single label and the query returns ONE row whose first column is
+"date" — a total disguised as a group. Same mechanism after the bag is folded away:
+`… | stats count by src_ip | stats sum(count) by dport`. The message points to `timechart span=<durée>` when the name is a
+calendar word (`date`, `hour`, …): the time slice exists in the language, it is `timechart span=`,
+not `by hour`. Known limit: on a base with a JSON bag, `by date` remains a plausible JSON key
+(`fields.date`) — undecidable at compile time, the output then shows a NULL key, never the label.
 
-**Sous un masque de champ, le sac JSON n'est jamais lu brut** (`bag_may_carry_masked_value`, une seule
-décision pour tout le compilateur). Le sac (`fields`) est écrit tel que le producteur de l'événement le
-fournit : il peut porter une clé de n'importe quel nom, y compris celui d'une colonne réelle. Dès que le
-jeu de masques de l'appelant n'est pas vide, toute lecture du sac retire donc chaque nom masqué — en
-sortie, dans une expression, comme clé de groupe, de partition ou de tri, et pour un alias qui n'en diffère
-que par la casse — et ce qui ne peut pas lire un sac caviardé est refusé en le disant : un prédicat de base
-sur le sac (`search fields=…`, joker, expression régulière, `in`) et une jointure dont la clé est le sac.
-Coût assumé : un appelant masqué filtre par nom de clé (`search <clé>=…`), plus sur le texte du sac ; cela
-vaut pour tout appelant quand une règle de déni s'applique à tous les rôles. Sans aucun masque, le SQL
-émis est inchangé à l'octet.
+**Under a field mask, the JSON bag is never read raw** (`bag_may_carry_masked_value`, a single
+decision for the whole compiler). The bag (`fields`) is written as the producer of the event
+supplies it: it can carry a key of any name, including that of a real column. As soon as the
+caller's mask set is not empty, every read of the bag therefore removes each masked name — in
+output, in an expression, as a group, partition or sort key, and for an alias that only differs
+from it by case — and what cannot read a redacted bag is refused, saying so: a base predicate
+on the bag (`search fields=…`, wildcard, regular expression, `in`) and a join whose key is the bag.
+Accepted cost: a masked caller filters by key name (`search <clé>=…`), no longer on the text of the
+bag; this applies to every caller when a deny rule applies to all roles. Without any mask, the SQL
+emitted is unchanged byte for byte.
 
-**Ce que le compilateur ne lit pas est refusé, jamais jeté ni lu de travers.** Trois familles de formes
-rendaient un résultat faux sans erreur ; elles sont refusées en disant quoi écrire, et aucune grammaire
-n'est ajoutée. *Le découpage en étapes respecte les guillemets doubles* : une barre verticale ou un crochet
-dans une valeur entre guillemets (`search url=~"/a|/b" | stats count`) n'est plus une frontière ; un
-guillemet non fermé est refusé. Dans une étape `rex`, et elle seule, `\"` est un guillemet du motif.
-*`search` relie ses termes par ET* : un `OR`, un `AND` ou un `NOT` nu et une parenthèse de groupement
-sont refusés (alternative : `champ in (a, b)` ou `champ=~"a|b"` ; négation : `champ!=valeur` ou
-`champ not in (…)` ; le mot ou la parenthèse comme texte : entre guillemets). *Une étape lit une grammaire
-fixe* : un second agrégat ou un alias dans `stats`, `eventstats` et `timechart` (`stats count as n` →
-`| rename count AS n`), un `BY` en majuscules, un argument en trop de `sort`, `head`, `top`, `rare`,
-`mvexpand`, `lookup`, `rate`, `append` ou `join` sont refusés en nommant le jeton. Coût assumé : un
-guillemet double isolé ne s'écrit plus hors d'un motif `rex` entre guillemets (dans une expression
-régulière : `\x22`). Sans aucune de ces formes, le SQL émis est inchangé à l'octet.
+**What the compiler does not read is refused, never dropped nor misread.** Three families of forms
+returned a wrong result without an error; they are refused, saying what to write, and no grammar is
+added. *Splitting into stages respects double quotes*: a vertical bar or a bracket
+in a quoted value (`search url=~"/a|/b" | stats count`) is no longer a boundary; an
+unclosed quote is refused. In a `rex` stage, and only there, `\"` is a quote of the pattern.
+*`search` joins its terms with AND*: a bare `OR`, `AND` or `NOT` and a grouping parenthesis
+are refused (alternative: `champ in (a, b)` or `champ=~"a|b"`; negation: `champ!=valeur` or
+`champ not in (…)`; the word or the parenthesis as text: in quotes). *A stage reads a fixed
+grammar*: a second aggregate or an alias in `stats`, `eventstats` and `timechart` (`stats count as n` →
+`| rename count AS n`), an uppercase `BY`, an extra argument to `sort`, `head`, `top`, `rare`,
+`mvexpand`, `lookup`, `rate`, `append` or `join` are refused, naming the token. Accepted cost: an
+isolated double quote can no longer be written outside a quoted `rex` pattern (in a regular
+expression: `\x22`). Without any of these forms, the SQL emitted is unchanged byte for byte.
 
-**Ce n'est pas une liste d'étapes, c'est une propriété vérifiée sur celles que le code déclare.** Une
-énumération écrite à la main avait déjà manqué une étape : `lookup … OUTPUT` découpait la chaîne
-elle-même, si bien que `lookup t k OUTPUT` et `lookup t k OUTPUT ,` compilaient en retombant sur la
-branche « OUTPUT absent » — la projection demandée disparaissait sans un mot. Deux tests remplacent
-l'énumération, et ils ne nomment aucune étape :
-- `no_typed_field_list_can_evaporate_whatever_the_step` **lit le dispatcheur** et le compilateur de
-  chaque étape, en dérive les positions de liste (*une position est une liste de noms si changer les
-  noms change le SQL*) et vérifie sur chacune, sur les 4 schémas livrés, qu'une liste sans aucun nom
-  est refusée. Deux modes, de portée différente et c'est écrit : quand la liste est **tout
-  l'argument** (`fields X`, `table X`), la détection est purement comportementale, indépendante de la
-  façon dont l'étape découpe ; quand un **mot-clé** l'introduit (`by`, `OUTPUT`), ce mot-clé est lu
-  dans le compilateur de l'étape — les mots-clés des étapes livrées le sont, une étape *future* qui
-  introduirait une liste par un mot-clé que ce test ne détecte pas y échapperait. Cette limite reste
-  une affaire de *projection perdue*, jamais de sécurité : l'invariant « aucun nom non valide n'atteint
-  le SQL » est tenu à part et **universellement**, pour toute étape présente ou future, par
-  `no_user_written_name_reaches_the_sql_raw` (il plante un nom porteur d'un guillemet dans chaque
-  position d'argument de chaque étape et vérifie qu'il n'atteint jamais le SQL émis) ;
-- `every_comma_split_of_the_compiler_is_the_door_or_a_written_exception` **lit la source** : tout
-  découpage sur la virgule est soit la porte, soit une exception déclarée avec sa raison (valeurs de
-  `in`, paires de `rename`, arguments de macro). Le détecteur clé sur le **séparateur virgule** (une
-  ligne portant `split` — toute la famille, `split`/`splitn`/`split_once`/`split_terminator`/
-  `split_inclusive`/`rsplit` — **et** un littéral virgule `','` ou `","`), donc un nouveau découpage à
-  la main le fait échouer quelle que soit la méthode. **Hors de portée, et c'est écrit dans le test :**
-  une virgule cachée derrière une constante nommée ou un cast numérique, ou un split étalé sur
-  plusieurs lignes — obfuscations qu'on n'écrit pas par accident. La **garantie** pour les étapes du
-  dispatcheur reste la garde d'EFFET ci-dessus, qui constate le résultat quelle que soit l'écriture ;
-  celle-ci est un garde-fou de forme.
+**This is not a list of stages, it is a property checked on the ones the code declares.** A
+hand-written enumeration had already missed a stage: `lookup … OUTPUT` split the string
+itself, so that `lookup t k OUTPUT` and `lookup t k OUTPUT ,` compiled by falling back on the
+"OUTPUT absent" branch — the requested projection vanished without a word. Two tests replace
+the enumeration, and they name no stage:
+- `no_typed_field_list_can_evaporate_whatever_the_step` **reads the dispatcher** and the compiler of
+  each stage, derives from them the list positions (*a position is a list of names if changing the
+  names changes the SQL*) and checks on each one, on the 4 shipped schemas, that a list without any
+  name is refused. Two modes, of different reach, and this is written: when the list is **the whole
+  argument** (`fields X`, `table X`), detection is purely behavioural, independent of how the stage
+  splits; when a **keyword** introduces it (`by`, `OUTPUT`), that keyword is read
+  in the stage's compiler — the keywords of the shipped stages are read there; a *future* stage that
+  would introduce a list with a keyword this test does not detect would escape it. This limit remains
+  a matter of *lost projection*, never of security: the invariant "no invalid name reaches
+  the SQL" is held separately and **universally**, for every present or future stage, by
+  `no_user_written_name_reaches_the_sql_raw` (it plants a name carrying a quote in every
+  argument position of every stage and checks that it never reaches the emitted SQL);
+- `every_comma_split_of_the_compiler_is_the_door_or_a_written_exception` **reads the source**: every
+  split on the comma is either the door, or an exception declared with its reason (values of
+  `in`, pairs of `rename`, macro arguments). The detector keys on the **comma separator** (a
+  line carrying `split` — the whole family, `split`/`splitn`/`split_once`/`split_terminator`/
+  `split_inclusive`/`rsplit` — **and** a comma literal `','` or `","`), so a new hand-written split
+  makes it fail whatever the method. **Out of reach, and this is written in the test:**
+  a comma hidden behind a named constant or a numeric cast, or a split spread over
+  several lines — obfuscations one does not write by accident. The **guarantee** for the dispatcher's
+  stages remains the EFFECT guard above, which observes the result whatever the writing;
+  this one is a guard on form.
 
-`table` et `lookup … OUTPUT` ont une grammaire différente — le **blanc** y est aussi un séparateur
-(`table a b` et `OUTPUT a b` sont légitimes, mesuré) — donc une *suite* de séparateurs y est
-indiscernable d'un seul et se réduit : `table a,,b` rend `a` et `b` (limite assumée, mesurée). Ce qui
-reste fermé : `table ,` et `lookup t k OUTPUT ,` sont refusés au lieu de disparaître. `table *` et
-`table` nu restent des **passe-plat délibérés** (ils ne restreignent pas la projection), inchangés,
-comme `lookup` **sans** `OUTPUT` (rien n'a été demandé) — la différence tient à ce que l'utilisateur a
-écrit : le mot-clé `OUTPUT` **tapé** est une demande explicite, l'absence de mot-clé n'en est pas une.
+`table` and `lookup … OUTPUT` have a different grammar — the **blank** is also a separator there
+(`table a b` and `OUTPUT a b` are legitimate, measured) — so a *run* of separators there is
+indistinguishable from a single one and is reduced: `table a,,b` gives `a` and `b` (accepted limit,
+measured). What stays closed: `table ,` and `lookup t k OUTPUT ,` are refused instead of vanishing.
+`table *` and bare `table` remain **deliberate pass-throughs** (they do not restrict the projection),
+unchanged, like `lookup` **without** `OUTPUT` (nothing was requested) — the difference lies in what
+the user wrote: the **typed** `OUTPUT` keyword is an explicit request, the absence of a keyword is not one.
 
-**La liste de *valeurs* d'un `champ in (…)` est la porte voisine, et sa frontière est ici.** Ce n'est
-pas une liste de noms, et les deux ne peuvent pas décider pareil parce que leurs **domaines** diffèrent :
-la chaîne vide n'est pas un nom de champ (refus), mais c'est une **valeur** légitime (un événement peut
-porter `host=''`). Ce qui est donc testé est le **texte écrit**, avant retrait des guillemets :
-`in ("",b)` rend `IN ('','b')` — la chaîne vide **demandée** survit (elle disparaissait avant, mesuré :
-`IN ('b')`) ; une entrée sans aucun texte est une **suite de séparateurs**, indiscernable d'un seul
-comme dans `table`, donc `in (a,,b)` rend `IN ('a','b')` (limite assumée, mesurée) ; et la liste
-**entièrement** vide (`in ()`, `in (,,)`) ne rend aucune valeur — SQLite n'ayant pas de `IN ()`, elle
-se replie sur `1=0` (`in`) / `1=1` (`not in`), jamais sur un filtre évanoui.
+**The list of *values* of a `champ in (…)` is the neighbouring door, and its boundary is here.** It
+is not a list of names, and the two cannot decide alike because their **domains** differ:
+the empty string is not a field name (refusal), but it is a legitimate **value** (an event can
+carry `host=''`). What is tested is therefore the **written text**, before quotes are removed:
+`in ("",b)` gives `IN ('','b')` — the **requested** empty string survives (it used to vanish, measured:
+`IN ('b')`); an entry without any text is a **run of separators**, indistinguishable from a single one
+as in `table`, so `in (a,,b)` gives `IN ('a','b')` (accepted limit, measured); and the
+**entirely** empty list (`in ()`, `in (,,)`) gives no value — SQLite having no `IN ()`, it
+falls back on `1=0` (`in`) / `1=1` (`not in`), never on a filter that vanished.
 
-### Bornes de compilation (le texte de requête est une entrée NON FIABLE)
-La compilation a lieu **avant** tout budget d'exécution du store : elle porte donc ses propres bornes.
-Chacune a un défaut sûr et se règle par l'environnement. **Au dépassement, une erreur claire est rendue
-à l'appelant** — jamais un panic, jamais une valeur substituée en silence.
+### Compilation bounds (the query text is UNTRUSTED input)
+Compilation happens **before** any execution budget of the store: it therefore carries its own bounds.
+Each has a safe default and is set through the environment. **When it is exceeded, a clear error is
+returned to the caller** — never a panic, never a value silently substituted.
 
-| Variable | Défaut | Plafond | Ce qu'elle borne |
+| Variable | Default | Ceiling | What it bounds |
 |---|---|---|---|
-| `GUATX_SOQL_MAX_SPAN_SECS` | `315360000` (10 ans) | `315360000` | le bucket `timechart span=` (secondes) |
-| `GUATX_SOQL_MAX_STAGES` | `64` | `1024` | le nombre d'étapes de pipe d'un pipeline |
-| `GUATX_SOQL_MAX_SQL_BYTES` | `1048576` (1 Mio) | `16777216` | la taille du SQL émis, vérifiée après chaque étape |
-| `GUATX_SOQL_MAX_TEXT_BYTES` | `1048576` (1 Mio) | `16777216` | la taille du texte de requête accepté |
+| `GUATX_SOQL_MAX_SPAN_SECS` | `315360000` (10 years) | `315360000` | the `timechart span=` bucket (seconds) |
+| `GUATX_SOQL_MAX_STAGES` | `64` | `1024` | the number of pipe stages of a pipeline |
+| `GUATX_SOQL_MAX_SQL_BYTES` | `1048576` (1 MiB) | `16777216` | the size of the emitted SQL, checked after each stage |
+| `GUATX_SOQL_MAX_TEXT_BYTES` | `1048576` (1 MiB) | `16777216` | the size of the accepted query text |
 
-Une borne de sécurité peut être **baissée, pas retirée** : au-dessus du plafond la valeur est refusée
-(la borne du span, dont le plafond vaut le défaut, ne peut donc qu'être baissée).
+A security bound can be **lowered, not removed**: above the ceiling the value is refused
+(the span bound, whose ceiling equals the default, can therefore only be lowered).
 
-Portée exacte de la borne de SQL : elle est vérifiée **après** chaque étape émettrice (la base, chaque
-champ calculé, chaque lookup automatique, puis chaque étape de pipe). Le pic **transitoire** d'une
-étape n'est donc pas borné par elle : c'est la borne du **texte d'entrée** qui le contient. Ordre de
-grandeur mesuré du couple : 400 006 octets de texte produisent 4 600 089 octets de SQL (×11,5) — donc
-refus, la borne de SQL étant franchie dès la première étape.
+Exact reach of the SQL bound: it is checked **after** each emitting stage (the base, each
+computed field, each automatic lookup, then each pipe stage). The **transient** peak of a
+stage is therefore not bounded by it: it is the bound on the **input text** that contains it. Order of
+magnitude measured for the pair: 400 006 bytes of text produce 4 600 089 bytes of SQL (×11.5) — hence
+refusal, the SQL bound being crossed from the first stage.
 
-Une variable **présente mais illisible** (non numérique, ≤ 0, au-dessus du plafond) est signalée comme
-une erreur de configuration, et non ramenée en silence au défaut : une borne que l'opérateur croit avoir
-posée ne doit jamais être ignorée sans le dire. Conséquence assumée, à connaître avant de déployer :
-tant que la variable est illisible, **toute requête qui consulte cette borne échoue** (fail-closed), et
-le message le dit — c'est une erreur de configuration *serveur*, pas une erreur de la requête. Seule une
-valeur **valide** est mise en cache (lecture unique par processus) : corriger une variable illisible ne
-demande **pas** de redémarrer le service ; en revanche une valeur valide déjà lue reste figée jusqu'au
-redémarrage.
+A variable that is **present but unreadable** (non-numeric, ≤ 0, above the ceiling) is reported as
+a configuration error, and not silently brought back to the default: a bound the operator believes
+they set must never be ignored without saying so. Accepted consequence, to know before deploying:
+as long as the variable is unreadable, **every query that consults this bound fails** (fail-closed),
+and the message says so — it is a *server* configuration error, not an error in the query. Only a
+**valid** value is cached (read once per process): fixing an unreadable variable does **not**
+require restarting the service; on the other hand a valid value already read stays frozen until
+restart.
 
-## Statut
-- ✅ Compilateur de Plume **promu + généralisé** ici (18 étapes de pipeline, schéma-générique). Suite complète : 161 tests (181 avec `--features forge`).
-- ✅ Consommé par la console Forge et par Plume via une **git-dep épinglée par tag** :
-  `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.2" }` — un clone autonome de
-  l'un ou l'autre produit compile sans avoir ce dépôt en voisin. **Épinglez `v0.2.2` ou plus récent.**
-  Deux raisons, de gravité très différente :
-  - `v0.2.0` émettait, sur une entrée non fiable, des filtres portant sur une colonne que l'utilisateur
-    n'avait jamais nommée (faux négatif silencieux dans une règle de détection) — corrigé en `v0.2.1`,
-    cf. les notes de ce tag. C'est la raison **de correction** : n'épinglez pas `v0.2.0`.
-  - `v0.2.1` est ANTÉRIEUR au renommage du langage en GXQL. Son code est identique à celui de
-    `v0.2.2` à trois messages d'erreur près, mais son README parle encore de « SOQL » : un lecteur
-    qui suit l'épinglage y atterrit et lit l'ancien nom. C'est la raison **documentaire** — pas un
-    défaut, juste un tag qui ne raconte plus le produit.
-- ✅ **Adoption par Plume terminée** : harnais de parité différentielle sur le corpus des requêtes
-  livrées avec le produit (banc `tests/plume_parity.rs`, 0 divergence inattendue), bascule du daemon, puis suppression
-  du compilateur interne. Aucune fonctionnalité perdue — ce cœur est désormais l'unique implémentation.
+## Status
+- ✅ Plume's compiler **promoted + generalised** here (18 pipeline stages, schema-generic). Full suite: 161 tests (181 with `--features forge`).
+- ✅ Consumed by the Forge console and by Plume via a **git-dep pinned by tag**:
+  `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.2" }` — a standalone clone of
+  either product compiles without having this repository next to it. **Pin `v0.2.2` or later.**
+  Two reasons, of very different severity:
+  - `v0.2.0` emitted, on untrusted input, filters on a column the user
+    had never named (silent false negative in a detection rule) — fixed in `v0.2.1`,
+    see the notes of that tag. This is the **correctness** reason: do not pin `v0.2.0`.
+  - `v0.2.1` PREDATES the renaming of the language to GXQL. Its code is identical to that of
+    `v0.2.2` except for three error messages, but its README still talks about "SOQL": a reader
+    who follows the pin lands there and reads the old name. This is the **documentation** reason — not a
+    defect, just a tag that no longer tells the story of the product.
+- ✅ **Adoption by Plume completed**: differential parity harness on the corpus of the queries
+  shipped with the product (bench `tests/plume_parity.rs`, 0 unexpected divergence), switch-over of the daemon, then removal
+  of the internal compiler. No functionality lost — this core is now the only implementation.
