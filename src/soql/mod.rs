@@ -309,7 +309,7 @@ pub struct Schema {
     /// le daemon (`with_message_pruning`) sur les chemins lourds (run_due_rules, Explore hors rollup-route).
     pub prune_message_projection: bool,
     /// FILTRE DE LIGNES OBLIGATOIRE (H1 — isolation tenant). `None` par DÉFAUT -> AUCUNE contrainte injectée
-    /// -> émission SQL BYTE-IDENTIQUE au legacy (invariant absolu mode 0 : `events()` et Forge community
+    /// -> émission SQL BYTE-IDENTIQUE au legacy (invariant absolu mode 0 : `events()` et `forge()` sans filtre
     /// intacts). `Some(RowFilter{column, ids})` (posé via `with_row_filter`) -> le compilateur AND-joint
     /// `<column> IN (<ids>)` (ou `1=0` si ids vide, fail-closed) dans le WHERE de CHAQUE base compilée
     /// (finding ET runrecord, à toute profondeur : append/join recompilent avec le MÊME schéma). Non
@@ -488,7 +488,7 @@ impl Schema {
     /// `<column> IN (<ids>)` posée. Le compilateur l'AND-joint alors dans le WHERE de CHAQUE base compilée
     /// (finding ET runrecord, à toute profondeur) comme un ATOME booléen NON CONTOURNABLE. Liste d'ids VIDE
     /// -> `1=0` (fail-closed : matche RIEN, jamais tout — un grant vide renvoie zéro ligne). Non appelé
-    /// (défaut `None`) -> émission SQL BYTE-IDENTIQUE au legacy (community / `events()` intacts). Posé par la
+    /// (défaut `None`) -> émission SQL BYTE-IDENTIQUE au legacy (schémas sans filtre / `events()` intacts). Posé par la
     /// console Forge d'après le jeu d'engagements accordés à l'appelant (`engagement_id`).
     pub fn with_row_filter(mut self, column: &str, ids: &[i64]) -> Schema {
         self.row_filter = Some(RowFilter { column: column.to_string(), ids: ids.to_vec() });
@@ -627,7 +627,7 @@ fn soql_filter_field(name: &str, numeric: bool, base: &BaseDef, d: &dyn Dialect)
 // `(<col> IN (<ids>))` (ou `1=0` fail-closed si ids vide) via `RowFilter::cond_sql` (le MÊME helper que la
 // feuille principale) dans le WHERE des DEUX accès physiques (`FROM metric` ET `FROM metric_rollup`) — ce
 // sont les feuilles de la base métrique, aucun étage aval ne peut échapper au filtre. `None`
-// (community/Plume/Forge) -> aucune condition ajoutée -> SQL byte-identique au legacy (invariant absolu).
+// (défaut, aucun filtre posé par le consommateur) -> aucune condition ajoutée -> SQL byte-identique au legacy (invariant absolu).
 fn metric_base(spec: &str, from: i64, to: i64, row_filter: Option<&RowFilter>, d: &dyn Dialect) -> Result<(String, Vec<String>), String> {
     let toks: Vec<&str> = spec.split_whitespace().collect();
     let name = match toks.get(1) {
@@ -1123,7 +1123,7 @@ fn append_cursor_id_col(mut base: BaseDef) -> BaseDef {
 // `row_filter` (H1 — isolation tenant) : Some -> AND-joint l'atome OBLIGATOIRE `(<col> IN (<ids>))` (ou
 // `1=0` fail-closed si ids vide) DANS le WHERE de CETTE base. C'est la FEUILLE — l'unique accès physique à
 // la table — donc aucun étage/sous-requête/UNION en aval ne peut y échapper (ils enveloppent une base déjà
-// filtrée). None (community/Plume) -> aucune condition -> SQL byte-identique au legacy.
+// filtrée). None (défaut, aucun filtre posé) -> aucune condition -> SQL byte-identique au legacy.
 fn table_base(spec: &str, base: &BaseDef, from: i64, to: i64, env: Option<&str>, row_filter: Option<&RowFilter>, d: &dyn Dialect) -> Result<(String, Vec<String>), String> {
     let kw_sp = format!("{} ", base.keyword);
     let first = if let Some(r) = spec.strip_prefix(&kw_sp) {
@@ -1355,7 +1355,7 @@ fn compile_depth(soql: &str, from: i64, to: i64, depth: u32, schema: &Schema) ->
     // mode 0 -> aucune injection -> parité SQL stricte.
     let env = schema.env_filter.as_deref();
     // FILTRE DE LIGNES OBLIGATOIRE : propagé À TOUTE PROFONDEUR aux bases (finding/runrecord) via
-    // `table_base`. None (community/Plume) -> aucune injection -> parité SQL stricte. Comme le schéma est
+    // `table_base`. None (défaut, aucun filtre posé) -> aucune injection -> parité SQL stricte. Comme le schéma est
     // passé tel quel aux sous-compilations (append/join), leurs bases héritent du MÊME filtre.
     let rf = schema.row_filter.as_ref();
     // DIALECT d'émission (readiness pivot) : porté par le schéma, `SqliteDialect` pour tous les schémas

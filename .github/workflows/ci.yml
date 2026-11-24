@@ -60,7 +60,7 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
-      # Passe 1 — build community DÉFAUT (feature OFF). ~70 % commun, compilateur SOQL unique.
+      # Passe 1 — build par DÉFAUT, sans feature produit (feature OFF). ~70 % commun, compilateur SOQL unique.
       - name: cargo test (défaut, feature OFF)
         run: cargo test --locked --verbose
 
@@ -106,7 +106,7 @@ jobs:
       # fichier : elle exige que TOUT fichier suivi porteur d'un NUL soit déclaré binaire dans
       # `.gitattributes` — donc un fichier ajouté demain est couvert par construction — et que
       # la déclaration reste étroite, pour qu'un `*.rs binary` ne la désarme pas d'une ligne.
-      # Ce dépôt n'a AUCUN binaire suivi (27 fichiers, 0 NUL) : la garde y est préventive, et
+      # Ce dépôt n'a AUCUN binaire suivi (0 NUL) : la garde y est préventive, et
       # c'est sa seule position utile — ajoutée après coup, elle ne prouverait rien sur le passé.
       - name: Aucun octet NUL non déclaré (sinon les scans de secrets sautent le fichier)
         run: python3 .github/scripts/check_no_stray_nul.py
