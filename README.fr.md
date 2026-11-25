@@ -21,7 +21,7 @@ Sous licence LGPL-3.0-or-later, voir [COPYING.LESSER](COPYING.LESSER).
   langage, même syntaxe, seul le nom change : `SOQL` était le nom du langage de requête de Salesforce).
   Le **module Rust reste `soql`** : le renommage porte sur le **nom du langage**, pas sur l'API — les
   identifiants publics (`guatx_core::soql::*`, `soql_esc`, `GUATX_SOQL_MAX_*`) sont **inchangés**, la
-  lib est taguée v0.2.2 et consommée telle quelle par Plume et Forge.
+  lib a été taguée v0.2.2 au renommage et reste consommée telle quelle par Plume et Forge.
   **La frontière du renommage, pour qu'elle ne soit pas prise pour un oubli :** ce qu'un UTILISATEUR
   lit dit `GXQL` (interfaces, documentation, messages d'erreur rendus) ; ce qu'un CONTRIBUTEUR lit
   garde `soql` (nom de module, identifiants, et les commentaires de `src/soql/` qui les décrivent).
@@ -241,9 +241,9 @@ redémarrage.
 ## Statut
 - ✅ Compilateur de Plume **promu + généralisé** ici (18 étapes de pipeline, schéma-générique). Suite complète : 194 tests (216 avec `--features forge`, 225 avec `--all-features`), mesurés le 2026-11-24 sur la version 0.2.6.
 - ✅ Consommé par la console Forge et par Plume via une **git-dep épinglée par tag** :
-  `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.2" }` — un clone autonome de
-  l'un ou l'autre produit compile sans avoir ce dépôt en voisin. **Épinglez `v0.2.2` ou plus récent.**
-  Deux raisons, de gravité très différente :
+  `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.6" }` — un clone autonome de
+  l'un ou l'autre produit compile sans avoir ce dépôt en voisin. **Épinglez `v0.2.6` ou plus récent.**
+  Trois raisons, de gravité très différente :
   - `v0.2.0` émettait, sur une entrée non fiable, des filtres portant sur une colonne que l'utilisateur
     n'avait jamais nommée (faux négatif silencieux dans une règle de détection) — corrigé en `v0.2.1`,
     cf. les notes de ce tag. C'est la raison **de correction** : n'épinglez pas `v0.2.0`.
@@ -251,6 +251,11 @@ redémarrage.
     `v0.2.2` à trois messages d'erreur près, mais son README parle encore de « SOQL » : un lecteur
     qui suit l'épinglage y atterrit et lit l'ancien nom. C'est la raison **documentaire** — pas un
     défaut, juste un tag qui ne raconte plus le produit.
+  - avant `v0.2.6`, certaines formes de requête étaient jetées ou lues de travers en silence
+    (un jeton qu'aucune étape ne lit, un `OR` nu, une clé de `stats … by` inconnue), et avant `v0.2.5`
+    un prédicat pouvait lire le sac JSON brut sous un masque de champ. `v0.2.6` refuse ce qu'il ne lit
+    pas ; cf. les notes des tags `v0.2.4` à `v0.2.6`. C'est la seconde raison **de correction**, et la
+    raison pour laquelle Plume et Forge épinglent tous deux `v0.2.6`.
 - ✅ **Adoption par Plume terminée** : harnais de parité différentielle sur le corpus des requêtes
   livrées avec le produit (banc `tests/plume_parity.rs`, 0 divergence inattendue), bascule du daemon, puis suppression
   du compilateur interne. Aucune fonctionnalité perdue — ce cœur est désormais l'unique implémentation.

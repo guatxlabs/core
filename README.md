@@ -21,7 +21,7 @@ Licensed under LGPL-3.0-or-later, see [COPYING.LESSER](COPYING.LESSER).
   language, same syntax, only the name changes: `SOQL` was the name of Salesforce's query language).
   The **Rust module stays `soql`**: the rename applies to the **language name**, not to the API — the
   public identifiers (`guatx_core::soql::*`, `soql_esc`, `GUATX_SOQL_MAX_*`) are **unchanged**, the
-  lib is tagged v0.2.2 and consumed as is by Plume and Forge.
+  lib was tagged v0.2.2 at the rename and is consumed as is by Plume and Forge.
   **Where the rename stops, so that it is not taken for an oversight:** what a USER reads says
   `GXQL` (interfaces, documentation, rendered error messages); what a CONTRIBUTOR reads keeps `soql`
   (module name, identifiers, and the comments of `src/soql/` that describe them).
@@ -241,9 +241,9 @@ restart.
 ## Status
 - ✅ Plume's compiler **promoted + generalised** here (18 pipeline stages, schema-generic). Full suite: 194 tests (216 with `--features forge`, 225 with `--all-features`), measured on 2026-11-24 on version 0.2.6.
 - ✅ Consumed by the Forge console and by Plume via a **git-dep pinned by tag**:
-  `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.2" }` — a standalone clone of
-  either product compiles without having this repository next to it. **Pin `v0.2.2` or later.**
-  Two reasons, of very different severity:
+  `guatx-core = { git = "https://github.com/guatxlabs/core", tag = "v0.2.6" }` — a standalone clone of
+  either product compiles without having this repository next to it. **Pin `v0.2.6` or later.**
+  Three reasons, of very different severity:
   - `v0.2.0` emitted, on untrusted input, filters on a column the user
     had never named (silent false negative in a detection rule) — fixed in `v0.2.1`,
     see the notes of that tag. This is the **correctness** reason: do not pin `v0.2.0`.
@@ -251,6 +251,10 @@ restart.
     `v0.2.2` except for three error messages, but its README still talks about "SOQL": a reader
     who follows the pin lands there and reads the old name. This is the **documentation** reason — not a
     defect, just a tag that no longer tells the story of the product.
+  - Tags before `v0.2.6` silently dropped or misread some query forms (a token no stage reads, a bare
+    `OR`, an unknown `stats … by` key), and before `v0.2.5` a predicate could read the JSON bag raw
+    under a field mask. `v0.2.6` refuses what it does not read; see the notes of tags `v0.2.4` to
+    `v0.2.6`. This is the second **correctness** reason, and why Plume and Forge both pin `v0.2.6`.
 - ✅ **Adoption by Plume completed**: differential parity harness on the corpus of the queries
   shipped with the product (bench `tests/plume_parity.rs`, 0 unexpected divergence), switch-over of the daemon, then removal
   of the internal compiler. No functionality lost — this core is now the only implementation.
